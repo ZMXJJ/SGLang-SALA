@@ -53,8 +53,17 @@ class PipelineConfig:
     # 临时目录配置
     temp_dir_prefix: str = "/tmp/test_pipeline"
     
+    # 临时目录配置
+    temp_dir_prefix: str = "/tmp/test_pipeline"
+    
     # 运行配置
     cleanup_after_test: bool = True
+    
+    # 新增配置
+    local_pkg_dir: str = ""  # 本地包目录
+    dataset_path: str = "dataset.jsonl"
+    output_dir: str = "outputs"
+    limit_inference: int = 10  # 限制推理数量
     
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "PipelineConfig":
@@ -106,7 +115,12 @@ class PipelineConfig:
                     'VENV_PATH': 'venv_path',
                     'CONDA_ENV_NAME': 'conda_env_name',
                     'TEMP_DIR_PREFIX': 'temp_dir_prefix',
+                    'TEMP_DIR_PREFIX': 'temp_dir_prefix',
                     'CLEANUP_AFTER_TEST': 'cleanup_after_test',
+                    'LOCAL_PKG_DIR': 'local_pkg_dir',
+                    'DATASET_PATH': 'dataset_path',
+                    'OUTPUT_DIR': 'output_dir',
+                    'LIMIT_INFERENCE': 'limit_inference',
                 }
                 
                 if key in key_mapping:
@@ -119,6 +133,12 @@ class PipelineConfig:
                             continue
                     elif attr_name == 'cleanup_after_test':
                         value = value.lower() == 'true'
+                    elif attr_name == 'limit_inference':
+                        try:
+                            value = int(value)
+                        except ValueError:
+                            logging.warning(f"无法解析 LIMIT_INFERENCE: {value}，使用默认值")
+                            continue
                     setattr(config, attr_name, value)
         
         return config
@@ -221,6 +241,9 @@ class TestPipeline:
             
             # 步骤 2: 环境解压
             self._extract_environment()
+            
+            # 步骤 2.5: 安装本地包 (如果指定)
+            self._install_local_packages()
             
             # 步骤 3: 生成测试代码
             self._generate_test_code()
@@ -419,8 +442,66 @@ class TestPipeline:
         self.logger.info(f"Python 解释器路径: {python_bin}")
         
         # 显示 Python 版本
-        result = subprocess.run([str(python_bin), "--version"], capture_output=True, text=True)
-        self.logger.info(f"Python 版本信息: {result.stdout.strip() or result.stderr.strip()}")
+        try:
+            result = subprocess.run([str(python_bin), "--version"], capture_output=True, text=True)
+            self.logger.info(f"Python 版本信息: {result.stdout.strip() or result.stderr.strip()}")
+        except Exception as e:
+            self.logger.warning(f"无法获取 Python 版本: {e}")
+        self.logger.info("")
+    
+    def _install_local_packages(self):
+        """步骤 2.5: 安装本地包"""
+        if not self.config.local_pkg_dir:
+            return
+            
+        self.logger.info("=" * 10 + " 步骤 2.5: 安装本地包 " + "=" * 10)
+        
+        pkg_dir = Path(self.config.local_pkg_dir)
+        if not pkg_dir.exists():
+            self.logger.warning(f"本地包目录不存在: {pkg_dir}")
+            return
+            
+        self.logger.info(f"正在从 {pkg_dir} 安装包...")
+        
+        # 获取 Python 解释器
+        python_bin = self.extracted_env_path / "bin" / "python"
+        if not python_bin.exists():
+            python_bin = self.extracted_env_path / "bin" / "python3"
+            
+        if not python_bin.exists():
+            # Fallback
+            for root, dirs, files in os.walk(self.extracted_env_path):
+                if "python" in files:
+                    python_bin = Path(root) / "python"
+                    break
+        
+        if not python_bin or not python_bin.exists():
+            self.logger.error("无法找到 Python 解释器，跳过安装")
+            return
+
+        # 查找所有 .whl 和 .tar.gz 文件
+        packages = list(pkg_dir.glob("*.whl")) + list(pkg_dir.glob("*.tar.gz"))
+        if not packages:
+            self.logger.warning("未找到安装包")
+            return
+            
+        self.logger.info(f"找到 {len(packages)} 个包")
+        
+        try:
+            cmd = [
+                str(python_bin), "-m", "pip", "install",
+                "--no-index",
+                "--find-links", str(pkg_dir)
+            ] + [str(p) for p in packages]
+            
+            # 运行安装
+            subprocess.run(cmd, check=True, capture_output=False) # 显示输出以便调试
+            self.logger.success("本地包安装完成")
+            
+        except Exception as e:
+            self.logger.error(f"安装失败: {e}")
+            # 不中断流水线，继续尝试
+        
         self.logger.info("")
     
     def _generate_test_code(self):
@@ -430,140 +511,124 @@ class TestPipeline:
         test_file = self.temp_dir / "test_inference.py"
         self.logger.info(f"正在生成测试文件: {test_file}")
         
-        # 测试代码模板 (保持原样)
-        test_code = '''#!/usr/bin/env python3
+        # 生成更复杂的推理脚本
+        inference_script_content = f'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-自动化推理测试脚本
-使用 vLLM 库加载模型并执行简单推理测试
+Generated Inference Script
 """
-
 import sys
 import os
+import json
 import time
-from typing import List
+from pathlib import Path
+from typing import List, Dict, Any
+
+# Add current directory to path to find local modules if needed
+sys.path.append(os.getcwd())
 
 def main():
     print("=" * 60)
-    print("vLLM 推理测试")
+    print("Inference Runner Started")
     print("=" * 60)
     
-    # 从环境变量获取配置
-    model_path = os.environ.get("MODEL_PATH", "/path/to/your/model")
-    test_prompt = os.environ.get("TEST_PROMPT", "1+1=?")
+    # Configuration from environment variables
+    model_path = os.environ.get("MODEL_PATH", "")
+    dataset_path = os.environ.get("DATASET_PATH", "dataset.jsonl")
+    output_dir = os.environ.get("OUTPUT_DIR", "outputs")
+    limit = int(os.environ.get("LIMIT_INFERENCE", "10"))
     gpu_memory_utilization = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.9"))
     
-    print(f"\\n[配置信息]")
-    print(f"  模型路径: {model_path}")
-    print(f"  测试 Prompt: {test_prompt}")
-    print(f"  GPU 显存使用率: {gpu_memory_utilization}")
-    print(f"  Python 版本: {sys.version}")
-    print(f"  Python 路径: {sys.executable}")
+    print(f"Model Path: {{model_path}}")
+    print(f"Dataset Path: {{dataset_path}}")
+    print(f"Output Dir: {{output_dir}}")
+    print(f"Limit: {{limit}}")
     
-    # 检查模型路径是否存在
-    if not os.path.exists(model_path):
-        print(f"\\n[警告] 模型路径不存在: {model_path}")
-        print("请设置正确的 MODEL_PATH")
-        print("当前将使用演示模式运行...")
-        run_demo_mode(test_prompt)
-        return
+    # Create output directory with timestamp
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    save_dir = Path(output_dir) / timestamp
+    save_dir.mkdir(parents=True, exist_ok=True)
+    output_file = save_dir / "results.jsonl"
+    
+    print(f"Results will be saved to: {{output_file}}")
+    
+    # Check dataset
+    if not os.path.exists(dataset_path):
+        print(f"Error: Dataset not found at {{dataset_path}}")
+        sys.exit(1)
+        
+    # Load dataset
+    data = []
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if i >= limit:
+                break
+            if line.strip():
+                data.append(json.loads(line.strip()))
+    
+    print(f"Loaded {{len(data)}} items for inference.")
     
     try:
-        print("\\n[步骤 1] 导入 vLLM 库...")
-        start_time = time.time()
+        print("\\n[Step 1] Loading vLLM...")
         from vllm import LLM, SamplingParams
-        import_time = time.time() - start_time
-        print(f"  vLLM 导入成功 (耗时: {import_time:.2f}s)")
         
-        print("\\n[步骤 2] 加载模型...")
-        start_time = time.time()
+        print(f"\\n[Step 2] Loading Model from {{model_path}}...")
         llm = LLM(
             model=model_path,
             trust_remote_code=True,
-            gpu_memory_utilization=gpu_memory_utilization
+            gpu_memory_utilization=gpu_memory_utilization,
+            tensor_parallel_size=1  # Assuming single GPU for simplicity in this script, or adjust as needed
         )
-        load_time = time.time() - start_time
-        print(f"  模型加载成功 (耗时: {load_time:.2f}s)")
         
-        print("\\n[步骤 3] 设置采样参数...")
         sampling_params = SamplingParams(
             temperature=0.7,
             top_p=0.9,
-            max_tokens=128
+            max_tokens=512
         )
-        print(f"  temperature: {sampling_params.temperature}")
-        print(f"  top_p: {sampling_params.top_p}")
-        print(f"  max_tokens: {sampling_params.max_tokens}")
         
-        print("\\n[步骤 4] 执行推理...")
-        prompts: List[str] = [test_prompt]
-        start_time = time.time()
+        print("\\n[Step 3] Running Inference...")
+        prompts = [item['question'] for item in data]
         outputs = llm.generate(prompts, sampling_params)
-        inference_time = time.time() - start_time
-        print(f"  推理完成 (耗时: {inference_time:.2f}s)")
         
-        print("\\n" + "=" * 60)
-        print("推理结果")
-        print("=" * 60)
-        for output in outputs:
-            prompt = output.prompt
+        print("\\n[Step 4] Saving Results...")
+        results = []
+        for i, output in enumerate(outputs):
             generated_text = output.outputs[0].text
-            print(f"\\n[Prompt]: {prompt}")
-            print(f"[Output]: {generated_text}")
+            item = data[i]
+            result_item = {{
+                "id": item.get("id", ""),
+                "question": item.get("question", ""),
+                "answer": item.get("answer", ""),
+                "prediction": generated_text
+            }}
+            results.append(result_item)
+            
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for res in results:
+                f.write(json.dumps(res, ensure_ascii=False) + "\\n")
+                
+        print(f"Successfully saved {{len(results)}} results.")
         
-        print("\\n" + "=" * 60)
-        print("测试完成 - 成功")
-        print("=" * 60)
-        
-    except ImportError as e:
-        print(f"\\n[错误] vLLM 库导入失败: {e}")
-        print("请确保 vLLM 已正确安装在当前环境中")
-        print("安装命令: pip install vllm")
+    except ImportError:
+        print("Error: vLLM not installed.")
         sys.exit(1)
-        
     except Exception as e:
-        print(f"\\n[错误] 推理过程发生异常: {e}")
+        print(f"Error during inference: {{e}}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-
-def run_demo_mode(test_prompt: str):
-    """演示模式"""
-    print("\\n" + "=" * 60)
-    print("演示模式")
-    print("=" * 60)
-    
-    try:
-        print("\\n[步骤 1] 检查 vLLM 库是否可用...")
-        import vllm
-        print(f"  vLLM 版本: {vllm.__version__}")
-        print("  vLLM 库可用!")
-        
-        print("\\n[步骤 2] 显示演示输出...")
-        print(f"\\n[Prompt]: {test_prompt}")
-        print(f"[Demo Output]: 2 (这是演示输出，实际推理需要配置有效的模型路径)")
-        
-        print("\\n" + "=" * 60)
-        print("演示模式完成 - vLLM 环境验证成功")
-        print("=" * 60)
-        
-    except ImportError as e:
-        print(f"\\n[错误] vLLM 库不可用: {e}")
-        print("请安装 vLLM: pip install vllm")
-        sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
 '''
         
         with open(test_file, 'w', encoding='utf-8') as f:
-            f.write(test_code)
+            f.write(inference_script_content)
         
         os.chmod(test_file, 0o755)
         
         self.logger.success(f"测试文件生成完成: {test_file}")
+
         self.logger.info("测试文件内容预览:")
         
         # 预览前 20 行
@@ -619,6 +684,11 @@ if __name__ == "__main__":
         env["MODEL_PATH"] = self.config.model_path
         env["TEST_PROMPT"] = self.config.test_prompt
         env["GPU_MEMORY_UTILIZATION"] = str(self.config.gpu_memory_utilization)
+        
+        # 新增环境变量
+        env["DATASET_PATH"] = str(Path(self.config.dataset_path).resolve())
+        env["OUTPUT_DIR"] = str(Path(self.config.output_dir).resolve())
+        env["LIMIT_INFERENCE"] = str(self.config.limit_inference)
         
         if self.config.cuda_visible_devices:
             env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
@@ -724,6 +794,27 @@ def parse_args() -> argparse.Namespace:
         help="测试提示词"
     )
     
+    parser.add_argument(
+        "--local-pkg-dir",
+        help="本地包目录"
+    )
+    
+    parser.add_argument(
+        "--dataset-path",
+        help="数据集路径"
+    )
+    
+    parser.add_argument(
+        "--output-dir",
+        help="输出目录"
+    )
+    
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="限制推理数量"
+    )
+    
     return parser.parse_args()
 
 
@@ -775,6 +866,18 @@ def main():
     
     if args.test_prompt:
         config.test_prompt = args.test_prompt
+        
+    if args.local_pkg_dir:
+        config.local_pkg_dir = args.local_pkg_dir
+        
+    if args.dataset_path:
+        config.dataset_path = args.dataset_path
+        
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        
+    if args.limit:
+        config.limit_inference = args.limit
     
     # 运行流水线
     pipeline = TestPipeline(config)
