@@ -1,15 +1,18 @@
 # ============================================================
-# GPQA 评测 Docker 镜像
+# 模型综合评测 Docker 镜像
 # 基于 NVIDIA CUDA 12.9.1 + MiniCPM-SALA
 #
 # 构建:
 #   docker build -t soar_eval .
 #
-# 运行:
-#   docker run --gpus all \
-#     -v /home/user/model/stage2_rc2_job_165691_iter_4400:/model/stage2_rc2_job_165691_iter_4400 \
-#     -v /path/to/gpqa_data:/data/gpqa \
-#     -e MODEL_PATH=/model/MiniCPM-SALA \
+# 运行（示例）:
+#   docker run --rm --gpus all \
+#     -v /path/to/model:/model/MODEL \
+#     -v /path/to/data:/data \
+#     -e MODEL_PATH=/model/MODEL \
+#     -e DATA_DIR=/data \
+#     -e EVAL_DATA_PATH=/data/public_set.jsonl \
+#     -e EVAL_DATA=/data/eval_data_128.jsonl \
 #     -e PORT=30000 \
 #     -e RECORD_ID=xxx \
 #     -e USER_ID=xxx \
@@ -45,7 +48,7 @@ RUN cd /opt/SGLang-MiniCPM-SALA \
 
 # ---- 复制评测脚本 ----
 WORKDIR /app
-COPY gpqa_eval.py /app/gpqa_eval.py
+COPY eval_model.py /app/eval_model.py
 COPY entrypoint.sh /app/entrypoint.sh
 COPY bench_serving.sh /app/bench_serving.sh
 RUN chmod +x /app/entrypoint.sh /app/bench_serving.sh
@@ -53,7 +56,7 @@ RUN chmod +x /app/entrypoint.sh /app/bench_serving.sh
 # ---- 默认环境变量 ----
 ENV MODEL_PATH=/model/stage2_rc2_job_165691_iter_4400 \
     PORT=30000 \
-    DATA_DIR=/data/gpqa \
+    DATA_DIR=/data \
     EVAL_DATA=/data/eval_data_128.jsonl \
     RECORD_ID="" \
     USER_ID="" \

@@ -5,7 +5,7 @@
 # 流程:
 #   1. 启动 SGLang 推理服务（后台）
 #   2. 等待服务就绪
-#   3. 运行 gpqa_eval.py 获取 acc
+#   3. 运行 eval_model.py 获取 acc
 #   4. 运行 bench_serving.sh（基于 sglang.bench_serving）获取 benchmark_duration
 #   5. 组装 JSON 结果输出到 stdout
 #   6. 关闭 SGLang 服务
@@ -13,25 +13,28 @@
 # 环境变量（后端传入）:
 #   MODEL_PATH   - 模型路径（必须）
 #   PORT         - SGLang 服务端口（默认 30000）
-#   DATA_DIR     - GPQA 数据集目录（默认 /data/gpqa）
-#   EVAL_DATA    - bench_serving 数据集路径（默认 /data/eval_data_128.jsonl）
+#   DATA_DIR     - 综合评测数据目录（默认 /data）
+#   EVAL_DATA_PATH - acc 评测数据集路径（JSONL，可选；默认 ${DATA_DIR}/public_set.jsonl）
+#   EVAL_DATA    - benchmark_duration 数据集路径（默认 /data/eval_data_128.jsonl）
 #   RECORD_ID    - 提交记录ID
 #   USER_ID      - 用户ID
 #   TASK_ID      - 任务ID
-#   GPQA_MAX_SAMPLES  - GPQA 每子集最多评测题数（可选，默认全部）
-#   BENCH_MAX_SAMPLES - bench_serving 最多数据条数（可选，默认全部）
+#   ACC_MAX_SAMPLES   - acc 评测最多样本数（可选，默认全部；兼容 GPQA_MAX_SAMPLES）
+#   BENCH_MAX_SAMPLES - benchmark_duration 最多数据条数（可选，默认全部）
 # ============================================================
 set -e
 
 # ---- 参数 ----
+export no_proxy="localhost,127.0.0.1"
+export NO_PROXY="localhost,127.0.0.1"
 MODEL_PATH="${MODEL_PATH:?环境变量 MODEL_PATH 未设置}"
 PORT="${PORT:-30000}"
-DATA_DIR="${DATA_DIR:-/data/gpqa}"
+DATA_DIR="${DATA_DIR:-/data}"
 EVAL_DATA="${EVAL_DATA:-/data/eval_data_128.jsonl}"
 RECORD_ID="${RECORD_ID:-}"
 USER_ID="${USER_ID:-}"
 TASK_ID="${TASK_ID:-}"
-GPQA_MAX_SAMPLES="${GPQA_MAX_SAMPLES:-}"
+ACC_MAX_SAMPLES="${ACC_MAX_SAMPLES:-${GPQA_MAX_SAMPLES:-}}"
 BENCH_MAX_SAMPLES="${BENCH_MAX_SAMPLES:-}"
 
 API_BASE="http://127.0.0.1:${PORT}"
@@ -106,7 +109,7 @@ python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --trust-remote-code \
     --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
+    --attention-backend minicpm_flashattn \
     --chunked-prefill-size 8192 \
     --max-running-requests 128 \
     --skip-server-warmup \
@@ -152,44 +155,44 @@ done
 echo "[entrypoint] SGLang 服务已就绪！"
 
 # ============================================================
-# Step 3: 运行 GPQA 评测
+# Step 3: 运行 模型评测 (eval_model.py)
 # ============================================================
-echo "[entrypoint] 开始 GPQA 评测 ..."
+echo "[entrypoint] 开始 模型评测 ..."
 ACC=0
 EVAL_ERROR=""
 
-EVAL_OUTPUT_DIR="/tmp/gpqa_outputs"
+# acc 评测数据：优先用 EVAL_DATA_PATH；否则默认取 ${DATA_DIR}/public_set.jsonl
+EVAL_DATA_PATH="${EVAL_DATA_PATH:-${DATA_DIR}/public_set.jsonl}"
 
-EVAL_CMD="python3 /app/gpqa_eval.py \
+EVAL_CMD="python3 /app/eval_model.py \
     --api_base ${API_BASE} \
-    --data_dir ${DATA_DIR} \
-    --subsets diamond \
-    --output_dir ${EVAL_OUTPUT_DIR} \
-    --concurrency 8 \
-    --max_tokens 16384"
+    --model_path ${MODEL_PATH} \
+    --data_path ${EVAL_DATA_PATH} \
+    --concurrency 8"
 
-if [ -n "${GPQA_MAX_SAMPLES}" ]; then
-    EVAL_CMD="${EVAL_CMD} --max_samples ${GPQA_MAX_SAMPLES}"
-    echo "[entrypoint] GPQA 每个子集最多评测 ${GPQA_MAX_SAMPLES} 题"
+if [ -n "${ACC_MAX_SAMPLES}" ]; then
+    EVAL_CMD="${EVAL_CMD} --num_samples ${ACC_MAX_SAMPLES}"
+    echo "[entrypoint] 评测脚本最多评测 ${ACC_MAX_SAMPLES} 条"
 fi
 
 if eval ${EVAL_CMD}; then
 
-    # 从 summary.json 提取 overall_accuracy
-    if [ -f "${EVAL_OUTPUT_DIR}/summary.json" ]; then
+    # 找到最新的输出目录下的 summary.json
+    SUMMARY_FILE=$(ls -t outputs/*/summary.json 2>/dev/null | head -1)
+    if [ -f "${SUMMARY_FILE}" ]; then
         ACC=$(python3 -c "
 import json
-with open('${EVAL_OUTPUT_DIR}/summary.json') as f:
+with open('${SUMMARY_FILE}') as f:
     data = json.load(f)
 print(data.get('overall_accuracy', 0))
 ")
-        echo "[entrypoint] GPQA 评测完成，overall accuracy: ${ACC}"
+        echo "[entrypoint] 评测完成，overall accuracy: ${ACC}"
     else
         EVAL_ERROR="评测完成但未找到 summary.json"
         echo "[entrypoint] [WARN] ${EVAL_ERROR}"
     fi
 else
-    EVAL_ERROR="GPQA 评测脚本执行失败"
+    EVAL_ERROR="评测脚本执行失败"
     echo "[entrypoint] [ERROR] ${EVAL_ERROR}"
 fi
 
