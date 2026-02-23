@@ -255,8 +255,9 @@ docker run --gpus '"device=0,1"' ...
 | `RECORD_ID` | 是 | 空 | 提交记录 ID |
 | `USER_ID` | 是 | 空 | 用户 ID |
 | `TASK_ID` | 是 | 空 | 任务 ID |
-| `SGL_KERNEL_WHEEL` | 否 | 空 | 选手提交的 `sgl-kernel` wheel 路径（优先级高于 `INPUT_URL`） |
-| `INPUT_URL` | 否 | 空 | 选手提交文件的预签名下载直链（作为 wheel 来源；未传 `SGL_KERNEL_WHEEL` 时使用） |
+| `SGLANG_KERNEL_WHEEL` | 否 | 空 | 选手提交的 `sgl-kernel` wheel 路径（推荐；优先级高于 `INPUT_URL`） |
+| `SGL_KERNEL_WHEEL` | 否 | 空 | 同上（兼容旧字段；以 `SGL_` 开头会触发 SGLang deprecated 警告，不推荐） |
+| `INPUT_URL` | 否 | 空 | 选手提交文件的预签名下载直链（作为 wheel 来源；未传 `SGLANG_KERNEL_WHEEL`/`SGL_KERNEL_WHEEL` 时使用） |
 | `SCORE_SYNC_URL` | 否 | 空 | 分数同步回调基址（POST `{SCORE_SYNC_URL}/score/sync`） |
 | `SCORE_SYNC_REQUIRED` | 否 | `0` | 为 `1` 时回调失败会置 `state=0`；为 `0` 时仅 stderr 警告，评测仍按实际结果输出 |
 | `SCORE_SYNC_RETRIES` | 否 | `3` | 分数同步重试次数 |
@@ -271,7 +272,7 @@ docker run --gpus '"device=0,1"' ...
 |-----------|---------|------|
 | 模型目录 | `/home/user/linbiyuan/models/MiniCPM-SALA` | 模型权重文件 |
 | 数据目录 | `/data` | 包含 `perf_public_set.jsonl` / `perf_private_set.jsonl` / `speed_eval.jsonl` |
-| 选手 wheel（可选） | 例如 `/submission/sgl-kernel.whl` | 配合 `SGL_KERNEL_WHEEL` 使用 |
+| 选手 wheel（可选） | 例如 `/submission/sgl-kernel.whl` | 配合 `SGLANG_KERNEL_WHEEL` 使用 |
 
 ### 数据集格式
 
@@ -306,7 +307,7 @@ docker run --gpus '"device=0,1"' ...
 
 本评测镜像支持在**启动 SGLang 之前**，通过 `pip` 安装选手提交的 **`sgl-kernel` wheel**，从而允许选手在**不修改评测脚本/规则**的前提下优化推理性能（加速但不影响 `acc`）。
 
-**优先级**：`SGL_KERNEL_WHEEL` > `INPUT_URL`。
+**优先级**：`SGLANG_KERNEL_WHEEL` > `SGL_KERNEL_WHEEL` > `INPUT_URL`。
 
 ### 方式 A：挂载 wheel（推荐，离线也可用）
 
@@ -318,7 +319,7 @@ docker run --gpus all \
   -e MODEL_PATH=/home/user/linbiyuan/models/MiniCPM-SALA \
   -e PERF_DATA=/data/perf_public_set.jsonl \
   -e SPEED_DATA=/data/speed_eval.jsonl \
-  -e SGL_KERNEL_WHEEL=/submission/sgl-kernel.whl \
+  -e SGLANG_KERNEL_WHEEL=/submission/sgl-kernel.whl \
   -e RECORD_ID=record_001 \
   -e USER_ID=user_001 \
   -e TASK_ID=task_001 \

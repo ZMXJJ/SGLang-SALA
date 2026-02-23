@@ -2,7 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/minicpm_sala_env"
+VENV_DIR="${SCRIPT_DIR}/sglang_minicpm_sala_env"
 PACKAGES_DIR="${SCRIPT_DIR}/packages"
 
 # PyPI 镜像：优先命令行参数，其次环境变量，默认官方源

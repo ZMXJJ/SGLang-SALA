@@ -20,8 +20,9 @@
 #   TASK_ID            - 任务ID
 #   PERF_MAX_SAMPLES   - 准确率评测最多样本数（可选，默认全部）
 #   SPEED_MAX_SAMPLES  - 速度评测最多数据条数（可选，默认全部）
-#   SGL_KERNEL_WHEEL   - 选手提交的 sgl-kernel wheel 路径（可选，优先级高于 INPUT_URL）
-#   INPUT_URL          - 选手提交文件预签名下载直链（可选，作为 wheel 来源；未传 SGL_KERNEL_WHEEL 时使用）
+#   SGLANG_KERNEL_WHEEL- 选手提交的 sgl-kernel wheel 路径（可选，推荐；优先级高于 INPUT_URL）
+#   SGL_KERNEL_WHEEL   - 同上（兼容旧字段；以 SGL_ 开头会触发 SGLang 的 deprecated 警告，不推荐）
+#   INPUT_URL          - 选手提交文件预签名下载直链（可选，作为 wheel 来源；未传 SGLANG_KERNEL_WHEEL/SGL_KERNEL_WHEEL 时使用）
 #   SCORE_SYNC_URL     - 分数同步回调地址基址（可选；POST {SCORE_SYNC_URL}/score/sync）
 #   SCORE_SYNC_REQUIRED- 分数同步是否强依赖（可选；默认 0；为 1 时回调失败会置 state=0）
 #   DISABLE_CUDA_GRAPH - 是否禁用 CUDA Graph（可选；默认 1，避免 flashinfer+graph 在高并发下不稳定）
@@ -43,6 +44,7 @@ SPEED_MAX_SAMPLES="${SPEED_MAX_SAMPLES:-}"
 GPU_PER_WORKER="${GPU_PER_WORKER:-1}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
+SGLANG_KERNEL_WHEEL="${SGLANG_KERNEL_WHEEL:-}"
 SGL_KERNEL_WHEEL="${SGL_KERNEL_WHEEL:-}"
 INPUT_URL="${INPUT_URL:-}"
 SCORE_SYNC_URL="${SCORE_SYNC_URL:-}"
@@ -216,12 +218,15 @@ install_submission_sgl_kernel() {
     SUBMISSION_ERROR=""
     local wheel_path=""
 
-    if [ -n "${SGL_KERNEL_WHEEL}" ]; then
+    if [ -n "${SGLANG_KERNEL_WHEEL}" ]; then
+        wheel_path="${SGLANG_KERNEL_WHEEL}"
+        echo "[entrypoint] 检测到选手 wheel（SGLANG_KERNEL_WHEEL）: ${wheel_path}" >&2
+    elif [ -n "${SGL_KERNEL_WHEEL}" ]; then
         wheel_path="${SGL_KERNEL_WHEEL}"
-        echo "[entrypoint] 检测到选手 wheel（SGL_KERNEL_WHEEL）: ${wheel_path}" >&2
+        echo "[entrypoint] 检测到选手 wheel（SGL_KERNEL_WHEEL，deprecated）: ${wheel_path}" >&2
     elif [ -n "${INPUT_URL}" ]; then
         wheel_path="/tmp/sgl_kernel_submission.whl"
-        echo "[entrypoint] 未提供 SGL_KERNEL_WHEEL，尝试从 INPUT_URL 下载 wheel ..." >&2
+        echo "[entrypoint] 未提供 SGLANG_KERNEL_WHEEL / SGL_KERNEL_WHEEL，尝试从 INPUT_URL 下载 wheel ..." >&2
         echo "  INPUT_URL: ${INPUT_URL}" >&2
         if ! curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${wheel_path}" "${INPUT_URL}" 1>&2; then
             SUBMISSION_ERROR="选手 wheel 下载失败（INPUT_URL）"
@@ -229,7 +234,7 @@ install_submission_sgl_kernel() {
         fi
         echo "[entrypoint] wheel 已下载到: ${wheel_path}" >&2
     else
-        echo "[entrypoint] 未提供选手 wheel（SGL_KERNEL_WHEEL/INPUT_URL 均为空），使用镜像内置 sgl-kernel" >&2
+        echo "[entrypoint] 未提供选手 wheel（SGLANG_KERNEL_WHEEL / SGL_KERNEL_WHEEL / INPUT_URL 均为空），使用镜像内置 sgl-kernel" >&2
         return 0
     fi
 
@@ -239,7 +244,8 @@ install_submission_sgl_kernel() {
     fi
 
     echo "[entrypoint] 校验 wheel 内容（仅允许 sgl-kernel）..." >&2
-    if ! python3 - "${wheel_path}" 1>&2 <<'PY'
+    local canonical_name=""
+    if ! canonical_name="$(python3 - "${wheel_path}" <<'PY'
 import hashlib
 import os
 import re
@@ -252,8 +258,11 @@ def norm_dist_name(name: str) -> str:
     # PEP 427-ish normalization for path prefixes
     return re.sub(r"[-_.]+", "_", name).lower()
 
+h = hashlib.sha256()
 with open(wheel_path, "rb") as f:
-    sha256 = hashlib.sha256(f.read()).hexdigest()
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+sha256 = h.hexdigest()
 
 try:
     zf = zipfile.ZipFile(wheel_path)
@@ -270,14 +279,21 @@ if not meta_candidates:
 meta_path = meta_candidates[0]
 meta = zf.read(meta_path).decode("utf-8", errors="replace")
 dist_name = None
+version = None
 for line in meta.splitlines():
-    if line.lower().startswith("name:"):
+    low = line.lower()
+    if low.startswith("name:"):
         dist_name = line.split(":", 1)[1].strip()
+    elif low.startswith("version:"):
+        version = line.split(":", 1)[1].strip()
+    if dist_name and version:
         break
 
 if not dist_name:
     print("[entrypoint] [ERROR] METADATA 缺少 Name 字段", file=sys.stderr)
     sys.exit(1)
+if not version:
+    version = "0"
 
 normalized = norm_dist_name(dist_name)
 if normalized != "sgl_kernel":
@@ -291,7 +307,7 @@ allowed_prefixes = (
     "sgl_kernel/",
     "sgl_kernel.libs/",
 )
-allowed_dist_dirs = re.compile(r"^sgl_kernel-[^/]+\\.(dist-info|data)/")
+allowed_dist_dirs = re.compile(r"^sgl_kernel-[^/]+?\.(dist-info|data)/")
 
 bad = []
 has_pth = False
@@ -318,15 +334,46 @@ if bad:
         print(f"  - {item}", file=sys.stderr)
     sys.exit(1)
 
+# 读取 wheel tag（用于生成“规范 wheel 文件名”，避免挂载/下载后被重命名导致 pip 安装失败）
+wheel_tag = None
+wheel_meta_candidates = sorted([n for n in names if n.endswith(".dist-info/WHEEL")])
+if wheel_meta_candidates:
+    wheel_txt = zf.read(wheel_meta_candidates[0]).decode("utf-8", errors="replace")
+    for line in wheel_txt.splitlines():
+        if line.startswith("Tag:"):
+            wheel_tag = line.split(":", 1)[1].strip()
+            break
+if not wheel_tag:
+    wheel_tag = "py3-none-any"
+
+parts = wheel_tag.split("-")
+if len(parts) != 3:
+    wheel_tag = "py3-none-any"
+    parts = wheel_tag.split("-")
+py_tag, abi_tag, plat_tag = parts
+
+ver_fn = re.sub(r"[^0-9A-Za-z.]+", "_", version)
+canonical = f"sgl_kernel-{ver_fn}-{py_tag}-{abi_tag}-{plat_tag}.whl"
+
 print(
-    f"[entrypoint] wheel 校验通过: dist={dist_name}, sha256={sha256[:16]}..., file={os.path.basename(wheel_path)}",
+    f"[entrypoint] wheel 校验通过: dist={dist_name}, version={version}, tag={wheel_tag}, sha256={sha256[:16]}..., file={os.path.basename(wheel_path)}",
     file=sys.stderr,
 )
+print(canonical)
 PY
-    then
+)"; then
         SUBMISSION_ERROR="选手 wheel 校验失败（仅允许 sgl-kernel 内容）"
         return 1
     fi
+
+    # pip 对 wheel 文件名有格式要求；为避免被重命名导致安装失败，这里复制到一个规范文件名再安装
+    local wheel_canon_path="/tmp/${canonical_name}"
+    if ! cp -f "${wheel_path}" "${wheel_canon_path}" 1>&2; then
+        SUBMISSION_ERROR="选手 wheel 复制失败（生成规范文件名）"
+        return 1
+    fi
+    wheel_path="${wheel_canon_path}"
+    echo "[entrypoint] wheel 已规范化为: ${wheel_path}" >&2
 
     echo "[entrypoint] 安装选手 sgl-kernel wheel ..." >&2
     pip uninstall -y sgl-kernel 1>/dev/null 2>&1 || true
@@ -362,9 +409,9 @@ cleanup() {
 trap cleanup EXIT
 
 # ============================================================
-# Step 0: 安装选手提交物（可选）
+# Step 0: 安装选手提交内容（可选）
 # ============================================================
-echo "[entrypoint] 检查并安装选手 sgl-kernel 提交物（如有）..."
+echo "[entrypoint] 检查并安装选手 sgl-kernel 提交内容（如有）..."
 if ! install_submission_sgl_kernel; then
     echo "[entrypoint] [ERROR] ${SUBMISSION_ERROR}" >&2
     output_result "0" "${SUBMISSION_ERROR}" "0" '{"S1":0,"S8":0,"Smax":0}'
