@@ -31,7 +31,7 @@ echo "[bench_serving] 数据集: ${EVAL_DATA}"
 
 # ============================================================
 # Step 1: 转换数据集格式
-# eval_data_128.jsonl -> custom 格式（conversations）
+# speed_eval.jsonl -> custom 格式（conversations）
 # ============================================================
 CONVERTED_DATA="/tmp/bench_eval_data.jsonl"
 

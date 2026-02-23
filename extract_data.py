@@ -12,10 +12,10 @@ PATHS = {
 
 OUTPUT_DIR = "acc_datasets"
 FILES = {
-    "public": os.path.join(OUTPUT_DIR, "public_set.jsonl"),
-    "private": os.path.join(OUTPUT_DIR, "private_set.jsonl"),
-    "public_source": os.path.join(OUTPUT_DIR, "public_set_source.jsonl"),
-    "private_source": os.path.join(OUTPUT_DIR, "private_set_source.jsonl"),
+    "public": os.path.join(OUTPUT_DIR, "perf_public_set.jsonl"),
+    "private": os.path.join(OUTPUT_DIR, "perf_private_set.jsonl"),
+    "public_source": os.path.join(OUTPUT_DIR, "perf_public_set_source.jsonl"),
+    "private_source": os.path.join(OUTPUT_DIR, "perf_private_set_source.jsonl"),
 }
 
 SAMPLES_PER_TASK = 60
@@ -151,9 +151,10 @@ def generate_meta_info(public_items, private_items):
             
         lines.append("")
         
-    with open("acc_datasets/meta_info.md", "w", encoding="utf-8") as f:
+    meta_path = os.path.join(OUTPUT_DIR, "perf_meta_info.md")
+    with open(meta_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    print("Generated acc_datasets/meta_info.md")
+    print(f"Generated {meta_path}")
 
 def extract():
     all_items = []

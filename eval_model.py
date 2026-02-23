@@ -197,7 +197,7 @@ def parse_args():
     parser.add_argument('--model_path', type=str, default='/user/linbiyuan/models/MiniCPM-SALA', help="Used for tokenizer loading")
     parser.add_argument('--api_base', type=str, default='http://127.0.0.1:30000', help="SGLang API base URL")
     parser.add_argument('--model_name', type=str, default=None, help="Model name for API requests. Auto-detected if not set.")
-    parser.add_argument('--data_path', type=str, default='acc_datasets/public_set.jsonl')
+    parser.add_argument('--data_path', type=str, default='data/public_set.jsonl')
     parser.add_argument('--max_seq_len', type=int, default=262144)
     parser.add_argument('--concurrency', type=int, default=8, help="Number of concurrent API requests")
     parser.add_argument('--num_samples', type=int, default=None, help="Number of samples to test")
@@ -310,11 +310,11 @@ def main():
             for line in f:
                 if line.strip():
                     dataset.append(json.loads(line))
+                    if args.num_samples and len(dataset) >= args.num_samples:
+                        break
     else:
         raise FileNotFoundError(f"Data file not found: {args.data_path}")
 
-    if args.num_samples:
-        dataset = dataset[:args.num_samples]
     print(f"Testing with {len(dataset)} samples.")
 
     # 2. Initialize Model Client
