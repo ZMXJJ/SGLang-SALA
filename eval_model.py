@@ -194,7 +194,7 @@ class SGLANGwithChatTemplate:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='/user/linbiyuan/models/MiniCPM-SALA', help="Used for tokenizer loading")
+    parser.add_argument('--model_path', type=str, default='openbmb/MiniCPM-SALA', help="Model Path")
     parser.add_argument('--api_base', type=str, default='http://127.0.0.1:30000', help="SGLang API base URL")
     parser.add_argument('--model_name', type=str, default=None, help="Model name for API requests. Auto-detected if not set.")
     parser.add_argument('--data_path', type=str, default='data/public_set.jsonl')
@@ -336,7 +336,7 @@ def main():
     )
 
     # 3. Generate
-    inputs = [item['prompt'] for item in dataset]
+    inputs = [item['question'] for item in dataset]
     print("Generating responses...")
     start_time = time.time()
     outputs = model.generate(inputs, max_out_len=65536)
@@ -382,7 +382,7 @@ def main():
         results_to_save.append({
             "index": i,
             "task": task,
-            "prompt": item['prompt'],
+            "question": item['question'],
             "gold": gold,
             "prediction": pred,
             "score": score,

@@ -57,7 +57,7 @@ output_file = sys.argv[2]
 
 def get_prompt(item):
     # 兼容不同字段命名（历史数据/新数据）
-    return item.get("input") or item.get("question") or item.get("prompt")
+    return item.get("question") or item.get("input") or item.get("prompt")
 
 n = 0
 with open(input_file, "r", encoding="utf-8") as fin, open(output_file, "w", encoding="utf-8") as fout:

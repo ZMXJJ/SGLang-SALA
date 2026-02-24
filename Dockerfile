@@ -11,10 +11,10 @@
 #
 # 运行（示例）:
 #   docker run --rm --gpus '"device=0"' \
-#     -v /path/to/model:/home/user/linbiyuan/models/MiniCPM-SALA \
+#     -v /path/to/model:/models/MiniCPM-SALA \
 #     -v /path/to/perf_public_set.jsonl:/data/perf_public_set.jsonl \
 #     -v /path/to/speed_eval.jsonl:/data/speed_eval.jsonl \
-#     -e MODEL_PATH=/home/user/linbiyuan/models/MiniCPM-SALA \
+#     -e MODEL_PATH=/models/MiniCPM-SALA \
 #     -e RECORD_ID=xxx \
 #     -e USER_ID=xxx \
 #     -e TASK_ID=xxx \
@@ -67,7 +67,7 @@ COPY bench_serving.sh /app/bench_serving.sh
 RUN chmod +x /app/entrypoint.sh /app/bench_serving.sh
 
 # ---- 默认环境变量 ----
-ENV MODEL_PATH=/home/user/linbiyuan/models/MiniCPM-SALA \
+ENV MODEL_PATH=/models/MiniCPM-SALA \
     PORT=30000 \
     PERF_DATA=/data/perf_public_set.jsonl \
     SPEED_DATA=/data/speed_eval.jsonl \

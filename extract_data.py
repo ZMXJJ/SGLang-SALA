@@ -171,7 +171,7 @@ def process_item_raw(item, task_name, jf, path_key: str):
     subtask = infer_subtask_from_filename(jf)
 
     return {
-        "prompt": final_prompt,
+        "question": final_prompt,
         "input_length": input_length,
         "output_length": output_length,
         "task": generic_task,
@@ -861,11 +861,19 @@ def extract():
         with open(source_path, 'w', encoding='utf-8') as f_src, \
              open(clean_path, 'w', encoding='utf-8') as f_clean:
             
-            for item in items:
-                f_src.write(json.dumps(item, ensure_ascii=False) + "\n")
-                clean_item = item.copy()
-                if 'source' in clean_item:
-                    del clean_item['source']
+            _FIELD_RENAME = {
+                "input_length": "prompt_tokens",
+                "output_length": "completion_tokens",
+            }
+            _CLEAN_EXCLUDE = {"source", "subtask", "path_key", "ctx"}
+
+            for idx, item in enumerate(items, 1):
+                src_item = {"index": idx}
+                src_item.update({_FIELD_RENAME.get(k, k): v for k, v in item.items()})
+                f_src.write(json.dumps(src_item, ensure_ascii=False) + "\n")
+                clean_item = {"index": idx}
+                clean_item.update({_FIELD_RENAME.get(k, k): v
+                                   for k, v in item.items() if k not in _CLEAN_EXCLUDE})
                 f_clean.write(json.dumps(clean_item, ensure_ascii=False) + "\n")
         
         print(f"Saved {len(items)} items to {source_path} and {clean_path}")
