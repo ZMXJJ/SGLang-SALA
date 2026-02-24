@@ -9,13 +9,12 @@
 #   bash /app/bench_serving.sh <API_BASE>
 #
 # 环境变量（可选）:
-#   SPEED_DATA_SMAX - Smax(不设并发上限) 数据集路径（默认 /data/speed_bench_cunlimited.jsonl）
+#   SPEED_DATA_S1   - S1(并发度1) 数据集路径（不设则跳过该项测试）
+#   SPEED_DATA_S8   - S8(并发度8) 数据集路径（不设则跳过该项测试）
+#   SPEED_DATA_SMAX - Smax(不设并发上限) 数据集路径（不设则跳过该项测试）
 #
 # 参数:
 #   API_BASE     - SGLang API 地址，如 http://127.0.0.1:30000
-#
-# 输出:
-#   最后一行输出 JSON: {"S1": xx.xx, "S8": xx.xx, "Smax": xx.xx}
 # ============================================================
 set -e
 
@@ -26,17 +25,17 @@ HOST=$(echo "${API_BASE}" | sed -E 's|https?://||' | cut -d: -f1)
 PORT=$(echo "${API_BASE}" | sed -E 's|https?://||' | cut -d: -f2)
 
 echo "[bench_serving] API: ${API_BASE} (host=${HOST}, port=${PORT})"
-DATA_S1="/data/speed_bench_c1.jsonl"
-DATA_S8="/data/speed_bench_c8.jsonl"
-DATA_SMAX="${SPEED_DATA_SMAX:-/data/speed_bench_cunlimited.jsonl}"
+DATA_S1="${SPEED_DATA_S1:-}"
+DATA_S8="${SPEED_DATA_S8:-}"
+DATA_SMAX="${SPEED_DATA_SMAX:-}"
 
 echo "[bench_serving] 数据集:"
-echo "  S1: ${DATA_S1}"
-echo "  S8: ${DATA_S8}"
-echo "  Smax: ${DATA_SMAX}"
+[ -n "${DATA_S1}" ] && echo "  S1: ${DATA_S1}" || echo "  S1: (未指定，跳过)"
+[ -n "${DATA_S8}" ] && echo "  S8: ${DATA_S8}" || echo "  S8: (未指定，跳过)"
+[ -n "${DATA_SMAX}" ] && echo "  Smax: ${DATA_SMAX}" || echo "  Smax: (未指定，跳过)"
 
-if [ ! -f "${DATA_S1}" ] || [ ! -f "${DATA_S8}" ] || [ ! -f "${DATA_SMAX}" ]; then
-    echo "[bench_serving] 未找到速度评测数据集，跳过 benchmark_duration"
+if [ -z "${DATA_S1}" ] && [ -z "${DATA_S8}" ] && [ -z "${DATA_SMAX}" ]; then
+    echo "[bench_serving] 未指定任何速度评测数据集，跳过 benchmark_duration"
     echo '{"S1":0,"S8":0,"Smax":0}'
     exit 0
 fi
@@ -87,10 +86,12 @@ PY
 # ============================================================
 # Step 2: 在 3 档并发度下分别运行 bench_serving
 # ============================================================
-RESULT_JSON="{}"
+RESULT_JSON='{"S1":0,"S8":0,"Smax":0}'
 
-# 定义 3 档测试: S1, S8, Smax(不限并发)
-BENCH_CONFIGS="S1:1 S8:8 Smax:"
+BENCH_CONFIGS=""
+[ -n "${DATA_S1}" ] && BENCH_CONFIGS="${BENCH_CONFIGS} S1:1"
+[ -n "${DATA_S8}" ] && BENCH_CONFIGS="${BENCH_CONFIGS} S8:8"
+[ -n "${DATA_SMAX}" ] && BENCH_CONFIGS="${BENCH_CONFIGS} Smax:"
 
 for CONFIG in ${BENCH_CONFIGS}; do
     LABEL=$(echo "${CONFIG}" | cut -d: -f1)
@@ -103,6 +104,11 @@ for CONFIG in ${BENCH_CONFIGS}; do
         DATASET_PATH="${DATA_S8}"
     elif [ "${LABEL}" = "Smax" ]; then
         DATASET_PATH="${DATA_SMAX}"
+    fi
+
+    if [ ! -f "${DATASET_PATH}" ]; then
+        echo "  [${LABEL}] 数据集文件不存在: ${DATASET_PATH}，跳过"
+        continue
     fi
 
     # 转换数据集（每档位独立转换，避免相互影响）
