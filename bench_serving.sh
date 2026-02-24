@@ -6,70 +6,83 @@
 # 分别跑完所有评测请求，记录 Benchmark Duration。
 #
 # 用法（容器内由 entrypoint.sh 调用）:
-#   bash /app/bench_serving.sh <API_BASE> <EVAL_DATA> [MAX_SAMPLES]
+#   bash /app/bench_serving.sh <API_BASE>
+#
+# 环境变量（可选）:
+#   SPEED_DATA_SMAX - Smax(不设并发上限) 数据集路径（默认 /data/speed_bench_cunlimited.jsonl）
 #
 # 参数:
 #   API_BASE     - SGLang API 地址，如 http://127.0.0.1:30000
-#   EVAL_DATA    - 评测数据集路径（原始 JSONL）
-#   MAX_SAMPLES  - 最多使用的数据条数（可选）
 #
 # 输出:
 #   最后一行输出 JSON: {"S1": xx.xx, "S8": xx.xx, "Smax": xx.xx}
 # ============================================================
 set -e
 
-API_BASE="${1:?用法: bash bench_serving.sh <API_BASE> <EVAL_DATA> [MAX_SAMPLES]}"
-EVAL_DATA="${2:?用法: bash bench_serving.sh <API_BASE> <EVAL_DATA> [MAX_SAMPLES]}"
-MAX_SAMPLES="${3:-}"
+API_BASE="${1:?用法: bash bench_serving.sh <API_BASE>}"
 
 # 解析 host 和 port
 HOST=$(echo "${API_BASE}" | sed -E 's|https?://||' | cut -d: -f1)
 PORT=$(echo "${API_BASE}" | sed -E 's|https?://||' | cut -d: -f2)
 
 echo "[bench_serving] API: ${API_BASE} (host=${HOST}, port=${PORT})"
-echo "[bench_serving] 数据集: ${EVAL_DATA}"
+DATA_S1="/data/speed_bench_c1.jsonl"
+DATA_S8="/data/speed_bench_c8.jsonl"
+DATA_SMAX="${SPEED_DATA_SMAX:-/data/speed_bench_cunlimited.jsonl}"
+
+echo "[bench_serving] 数据集:"
+echo "  S1: ${DATA_S1}"
+echo "  S8: ${DATA_S8}"
+echo "  Smax: ${DATA_SMAX}"
+
+if [ ! -f "${DATA_S1}" ] || [ ! -f "${DATA_S8}" ] || [ ! -f "${DATA_SMAX}" ]; then
+    echo "[bench_serving] 未找到速度评测数据集，跳过 benchmark_duration"
+    echo '{"S1":0,"S8":0,"Smax":0}'
+    exit 0
+fi
 
 # ============================================================
-# Step 1: 转换数据集格式
-# speed_eval.jsonl -> custom 格式（conversations）
+# Step 1: 转换数据集格式（逐档位）
+# speed_*.jsonl -> custom 格式（conversations）
 # ============================================================
-CONVERTED_DATA="/tmp/bench_eval_data.jsonl"
+convert_dataset() {
+    local input_file="$1"
+    local output_file="$2"
 
-python3 -c "
+    python3 - "$input_file" "$output_file" <<'PY'
 import json
 import sys
 
-input_file = '${EVAL_DATA}'
-output_file = '${CONVERTED_DATA}'
-max_samples = ${MAX_SAMPLES:-0} or None
+input_file = sys.argv[1]
+output_file = sys.argv[2]
 
-data = []
-with open(input_file, 'r', encoding='utf-8') as f:
-    for line in f:
+def get_prompt(item):
+    # 兼容不同字段命名（历史数据/新数据）
+    return item.get("input") or item.get("question") or item.get("prompt")
+
+n = 0
+with open(input_file, "r", encoding="utf-8") as fin, open(output_file, "w", encoding="utf-8") as fout:
+    for line_num, line in enumerate(fin, 1):
         line = line.strip()
-        if line:
-            data.append(json.loads(line))
+        if not line:
+            continue
+        item = json.loads(line)
+        prompt = get_prompt(item)
+        if prompt is None:
+            raise KeyError(f"Missing prompt field at line {line_num}. Need one of: input/question/prompt")
 
-if max_samples and len(data) > max_samples:
-    data = data[:max_samples]
-    print(f'[bench_serving] 数据截断至 {max_samples} 条')
-
-with open(output_file, 'w', encoding='utf-8') as f:
-    for item in data:
-        # bench_serving custom 格式: conversations 数组，至少 2 轮
         converted = {
-            'conversations': [
-                {'role': 'user', 'content': item['input']},
-                {'role': 'assistant', 'content': item.get('model_response', 'placeholder')}
+            "conversations": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": item.get("model_response", "placeholder")},
             ]
         }
-        f.write(json.dumps(converted, ensure_ascii=False) + '\n')
+        fout.write(json.dumps(converted, ensure_ascii=False) + "\n")
+        n += 1
 
-print(f'[bench_serving] 转换完成: {len(data)} 条 -> {output_file}')
-"
-
-NUM_PROMPTS=$(wc -l < "${CONVERTED_DATA}")
-echo "[bench_serving] 总请求数: ${NUM_PROMPTS}"
+print(n)
+PY
+}
 
 # ============================================================
 # Step 2: 在 3 档并发度下分别运行 bench_serving
@@ -83,6 +96,22 @@ for CONFIG in ${BENCH_CONFIGS}; do
     LABEL=$(echo "${CONFIG}" | cut -d: -f1)
     CONC=$(echo "${CONFIG}" | cut -d: -f2)
 
+    # 选择该档位的数据集
+    if [ "${LABEL}" = "S1" ]; then
+        DATASET_PATH="${DATA_S1}"
+    elif [ "${LABEL}" = "S8" ]; then
+        DATASET_PATH="${DATA_S8}"
+    elif [ "${LABEL}" = "Smax" ]; then
+        DATASET_PATH="${DATA_SMAX}"
+    fi
+
+    # 转换数据集（每档位独立转换，避免相互影响）
+    CONVERTED_DATA="/tmp/bench_eval_data_${LABEL}.jsonl"
+    echo "[bench_serving] [${LABEL}] 数据集: ${DATASET_PATH}"
+    convert_dataset "${DATASET_PATH}" "${CONVERTED_DATA}" >/dev/null
+    NUM_PROMPTS=$(wc -l < "${CONVERTED_DATA}" 2>/dev/null || echo "0")
+    echo "[bench_serving] [${LABEL}] 转换完成: ${NUM_PROMPTS} 条 -> ${CONVERTED_DATA}"
+
     echo ""
     echo "────────────────────────────────────────────────────────────"
     if [ -n "${CONC}" ]; then
@@ -91,6 +120,18 @@ for CONFIG in ${BENCH_CONFIGS}; do
         echo "  [${LABEL}] 开始测试 - 无并发上限, 共 ${NUM_PROMPTS} 条请求"
     fi
     echo "────────────────────────────────────────────────────────────"
+
+    if [ "${NUM_PROMPTS}" = "0" ]; then
+        echo "  [${LABEL}] 无有效请求（NUM_PROMPTS=0），跳过该档位"
+        DURATION="0"
+        RESULT_JSON=$(python3 -c "
+import json
+result = json.loads('${RESULT_JSON}')
+result['${LABEL}'] = float('${DURATION}')
+print(json.dumps(result))
+")
+        continue
+    fi
 
     # 构建 bench_serving 命令
     BENCH_CMD="python3 -m sglang.bench_serving \

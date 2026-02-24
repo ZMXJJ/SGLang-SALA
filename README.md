@@ -13,7 +13,9 @@ SOAR/
 ├── data/                           # 评测数据集
 │   ├── perf_public_set.jsonl       # 公开集（acc 评测）
 │   ├── perf_private_set.jsonl      # 私有集（acc 评测）
-│   ├── speed_eval.jsonl            # 速度评测数据（benchmark_duration）
+│   ├── speed_bench_c1.jsonl        # 速度评测数据（S1，并发=1，可选）
+│   ├── speed_bench_c8.jsonl        # 速度评测数据（S8，并发=8，可选）
+│   ├── speed_eval.jsonl            # 旧速度评测数据（deprecated，不再使用）
 │   ├── perf_public_set_source.jsonl    # 公开集（溯源版，可选）
 │   ├── perf_private_set_source.jsonl   # 私有集（溯源版，可选）
 │   └── meta_info.md                # 数据集说明
@@ -58,15 +60,10 @@ bash install.sh https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --trust-remote-code \
-    --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
-    --chunked-prefill-size 8192 \
-    --tp-size "${GPU_PER_WORKER}" \
-    --max-running-requests "${MAX_RUNNING_REQUESTS}" \
-    --disable-cuda-graph \
-    --skip-server-warmup \
     --port "${PORT}" \
-    --dense-as-sparse \
+    ${SGLANG_SERVER_ARGS} \
+    --tp-size 1 \
+    --max-running-requests 32 \
     --enable-metrics
 ```
 
@@ -76,15 +73,15 @@ python3 -m sglang.launch_server \
 |------|------|------|
 | `--model-path` | 由 `MODEL_PATH` 环境变量指定 | 模型权重路径 |
 | `--trust-remote-code` | - | 允许执行模型仓库中的自定义代码 |
-| `--disable-radix-cache` | - | 禁用 Radix Cache（前缀缓存），评测规则要求 |
-| `--attention-backend` | `minicpm_flashinfer` | 使用 MiniCPM 专用 FlashInfer attention 后端（Blackwell / sm_120 推荐） |
-| `--chunked-prefill-size` | `8192` | Prefill 阶段每次处理的最大 token 数 |
-| `--tp-size` | 由 `GPU_PER_WORKER` 环境变量指定 | 张量并行大小（单机多卡） |
-| `--max-running-requests` | 由 `MAX_RUNNING_REQUESTS` 环境变量指定 | 服务端最大并发请求数 |
-| `--disable-cuda-graph` | 由 `DISABLE_CUDA_GRAPH=1` 启用 | 禁用 CUDA Graph（用于规避 flashinfer 在高并发下的不稳定问题） |
-| `--skip-server-warmup` | - | 跳过服务预热，加快启动速度 |
 | `--port` | 由 `PORT` 环境变量指定（默认 30000） | HTTP 服务端口 |
-| `--dense-as-sparse` | - | MiniCPM 模型专用的稀疏注意力优化 |
+| `--tp-size` | 固定 `1` | 张量并行大小（单机多卡） |
+| `--max-running-requests` | 固定 `32` | 服务端最大并发请求数（入口脚本固定，避免评测口径漂移） |
+| `--disable-radix-cache` | 由 `SGLANG_SERVER_ARGS` 指定（默认启用） | 禁用 Radix Cache（前缀缓存），评测规则要求 |
+| `--attention-backend` | 由 `SGLANG_SERVER_ARGS` 指定（默认 `minicpm_flashinfer`） | 注意力后端选择 |
+| `--chunked-prefill-size` | 由 `SGLANG_SERVER_ARGS` 指定（默认 `8192`） | Prefill 阶段每次处理的最大 token 数 |
+| `--skip-server-warmup` | 由 `SGLANG_SERVER_ARGS` 指定（默认启用） | 跳过服务预热，加快启动速度 |
+| `--dense-as-sparse` | 由 `SGLANG_SERVER_ARGS` 指定（默认启用） | MiniCPM 模型专用的稀疏注意力优化 |
+| `--disable-cuda-graph` | 由 `SGLANG_SERVER_ARGS` 追加（默认不加） | 如遇高并发不稳定，可尝试追加该参数以提升稳定性 |
 | `--enable-metrics` | - | 开启 Prometheus 指标采集 |
 
 ---
@@ -137,11 +134,11 @@ python3 -m sglang.launch_server \
 | `Smax` | 不设 `--max-concurrency` | 无并发上限，全部请求同时发送 |
 
 - 每档测试前清除 prefix cache（`--flush-cache`）
-- 使用 `speed_eval.jsonl` 数据集（默认 128 条真实评测数据）
+- 使用 `speed_bench_c1.jsonl`（S1）、`speed_bench_c8.jsonl`（S8），以及 `SPEED_DATA_SMAX` 指定的数据集（默认 `/data/speed_bench_cunlimited.jsonl`；用于 Smax）；若未提供这三者则**跳过速度评测**
 
 **工作流程**：
 
-1. 将 `speed_eval.jsonl` 转换为 `sglang.bench_serving` 的 `custom` 格式（`conversations` 数组）
+1. 将速度数据集转换为 `sglang.bench_serving` 的 `custom` 格式（`conversations` 数组）
 2. 依次在 S1 → S8 → Smax 三档并发度下运行 `sglang.bench_serving`
 3. 从输出中提取 `Benchmark duration (s):` 的值
 4. 输出汇总 JSON：`{"S1": xx.xx, "S8": xx.xx, "Smax": xx.xx}`
@@ -188,8 +185,8 @@ docker build -t soar_eval .
 ### 3.3 推送到远程仓库
 
 ```bash
-docker tag soar_eval:latest modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.4
-docker push modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.4
+docker tag soar_eval:latest modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.5
+docker push modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.5
 ```
 
 ---
@@ -220,7 +217,6 @@ docker run --gpus all \
   -e USER_ID=test_user \
   -e TASK_ID=test_task \
   -e PERF_MAX_SAMPLES=5 \
-  -e SPEED_MAX_SAMPLES=5 \
   soar_eval:latest
 ```
 
@@ -246,23 +242,20 @@ docker run --gpus '"device=0,1"' ...
 | `MODEL_PATH` | 是 | - | 容器内模型路径 |
 | `PORT` | 否 | `30000` | SGLang 服务端口 |
 | `PERF_DATA` | 否 | `/data/perf_public_set.jsonl` | 准确率评测数据集路径（JSONL）；切私有集可传 `/data/perf_private_set.jsonl` |
-| `SPEED_DATA` | 否 | `/data/speed_eval.jsonl` | 速度评测数据集路径（JSONL） |
 | `PERF_MAX_SAMPLES` | 否 | 空 | 准确率评测最多样本数（调试用，不传则跑全量） |
-| `SPEED_MAX_SAMPLES` | 否 | 空 | 速度评测最多数据条数（调试用，不传则跑全量） |
-| `GPU_PER_WORKER` | 否 | `1` | `--tp-size`，单机多卡时设置 |
-| `MAX_RUNNING_REQUESTS` | 否 | `32` | `--max-running-requests`，建议在全量 benchmark（128 条）时设为 `128` 以避免排队 |
-| `DISABLE_CUDA_GRAPH` | 否 | `1` | 为 `1` 时禁用 CUDA Graph（更稳；若想尝试更快可设为 `0`） |
+| `SGLANG_SERVER_ARGS` | 否 | `--disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse` | SGLang 服务启动参数（用于调整除 tp/max_running_requests 以外的大部分参数；入口脚本固定 `--tp-size 1`、`--max-running-requests 32`） |
+| `SPEED_DATA_SMAX` | 否 | `/data/speed_bench_cunlimited.jsonl` | 速度评测 Smax 档位数据集路径（不设并发上限） |
 | `RECORD_ID` | 是 | 空 | 提交记录 ID |
 | `USER_ID` | 是 | 空 | 用户 ID |
 | `TASK_ID` | 是 | 空 | 任务 ID |
-| `SGLANG_KERNEL_WHEEL` | 否 | 空 | 选手提交的 `sgl-kernel` wheel 路径（推荐；优先级高于 `INPUT_URL`） |
-| `SGL_KERNEL_WHEEL` | 否 | 空 | 同上（兼容旧字段；以 `SGL_` 开头会触发 SGLang deprecated 警告，不推荐） |
-| `INPUT_URL` | 否 | 空 | 选手提交文件的预签名下载直链（作为 wheel 来源；未传 `SGLANG_KERNEL_WHEEL`/`SGL_KERNEL_WHEEL` 时使用） |
+| `SGLANG_KERNEL_WHEEL` | 否 | 空 | 选手提交的 `sgl-kernel` wheel 路径 |
 | `SCORE_SYNC_URL` | 否 | 空 | 分数同步回调基址（POST `{SCORE_SYNC_URL}/score/sync`） |
 | `SCORE_SYNC_REQUIRED` | 否 | `0` | 为 `1` 时回调失败会置 `state=0`；为 `0` 时仅 stderr 警告，评测仍按实际结果输出 |
 | `SCORE_SYNC_RETRIES` | 否 | `3` | 分数同步重试次数 |
 | `SCORE_SYNC_CONNECT_TIMEOUT` | 否 | `5` | 分数同步连接超时（秒） |
 | `SCORE_SYNC_TIMEOUT` | 否 | `20` | 分数同步总超时（秒） |
+
+**速度评测启用方式**：当容器内同时存在 `/data/speed_bench_c1.jsonl`、`/data/speed_bench_c8.jsonl`，以及 `SPEED_DATA_SMAX` 指向的文件（默认 `/data/speed_bench_cunlimited.jsonl`）时，才会运行速度评测并输出 `S1/S8/Smax`，否则跳过速度评测（值为 0）。
 
 ---
 
@@ -271,7 +264,7 @@ docker run --gpus '"device=0,1"' ...
 | 宿主机路径 | 容器路径 | 说明 |
 |-----------|---------|------|
 | 模型目录 | `/home/user/linbiyuan/models/MiniCPM-SALA` | 模型权重文件 |
-| 数据目录 | `/data` | 包含 `perf_public_set.jsonl` / `perf_private_set.jsonl` / `speed_eval.jsonl` |
+| 数据目录 | `/data` | 包含 `perf_public_set.jsonl` / `perf_private_set.jsonl`；可选包含 `speed_bench_c1.jsonl` / `speed_bench_c8.jsonl` / `speed_bench_cunlimited.jsonl`（用于速度评测） |
 | 选手 wheel（可选） | 例如 `/submission/sgl-kernel.whl` | 配合 `SGLANG_KERNEL_WHEEL` 使用 |
 
 ### 数据集格式
@@ -288,16 +281,16 @@ docker run --gpus '"device=0,1"' ...
 }
 ```
 
-**速度评测数据集**（`speed_eval.jsonl`）：每行一个 JSON 对象，包含以下字段：
+**速度评测数据集**（`speed_bench_c1.jsonl` / `speed_bench_c8.jsonl`）：每行一个 JSON 对象，至少包含 `question` 字段（脚本会按 `input` / `question` / `prompt` 依次取 prompt）。
 
 ```json
 {
   "index": 0,
   "question": "...",
-  "input": "完整的 prompt 文本（用于推理）",
   "model_response": "参考回复",
   "prompt_tokens": 1234,
-  "completion_tokens": 567
+  "completion_tokens": 567,
+  "total_tokens": 1801
 }
 ```
 
@@ -306,8 +299,6 @@ docker run --gpus '"device=0,1"' ...
 ## 6.1 比赛提交流程（推荐：官方 evaluator 镜像 + wheel）
 
 本评测镜像支持在**启动 SGLang 之前**，通过 `pip` 安装选手提交的 **`sgl-kernel` wheel**，从而允许选手在**不修改评测脚本/规则**的前提下优化推理性能（加速但不影响 `acc`）。
-
-**优先级**：`SGLANG_KERNEL_WHEEL` > `SGL_KERNEL_WHEEL` > `INPUT_URL`。
 
 ### 方式 A：挂载 wheel（推荐，离线也可用）
 
@@ -318,20 +309,11 @@ docker run --gpus all \
   -v /path/to/sgl-kernel.whl:/submission/sgl-kernel.whl:ro \
   -e MODEL_PATH=/home/user/linbiyuan/models/MiniCPM-SALA \
   -e PERF_DATA=/data/perf_public_set.jsonl \
-  -e SPEED_DATA=/data/speed_eval.jsonl \
   -e SGLANG_KERNEL_WHEEL=/submission/sgl-kernel.whl \
   -e RECORD_ID=record_001 \
   -e USER_ID=user_001 \
   -e TASK_ID=task_001 \
-  modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.4
-```
-
-### 方式 B：使用预签名链接下载 wheel（需要容器可联网）
-
-```bash
-docker run ... \
-  -e INPUT_URL="https://example.com/presigned-download.whl" \
-  modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.4
+  modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.5
 ```
 
 ### wheel 安全约束（评测侧强制）
@@ -339,6 +321,26 @@ docker run ... \
 - wheel 必须是 `sgl-kernel`（wheel 内 `METADATA Name` 为 `sgl-kernel` / `sgl_kernel`）
 - wheel 只允许包含 `sgl_kernel/` 以及 `sgl_kernel-*.dist-info/`、`sgl_kernel-*.data/`、`sgl_kernel.libs/` 等必要文件；禁止 `.pth` 与其它顶层包
 - 安装采用 `pip install --no-deps --force-reinstall`，避免选手替换 Torch / FlashInfer / SGLang 等依赖（保证公平与可复现）
+
+---
+
+## 6.2 公开集 / 私有集切换机制（方便自测，不影响正式评测）
+
+本方案的核心是：**同一套 evaluator 镜像 + 同一套入口脚本**，通过平台侧注入环境变量 `PERF_DATA` 来选择数据集。
+
+- **选手自测（公开集）**：
+  - 平台/选手仅拿到 `perf_public_set.jsonl`
+  - 容器默认 `PERF_DATA=/data/perf_public_set.jsonl`，无需额外配置
+
+- **正式评测（私有集）**：
+  - 平台侧将 `perf_private_set.jsonl`（不对外公开）挂载到容器 `/data/perf_private_set.jsonl`
+  - 平台侧设置 `PERF_DATA=/data/perf_private_set.jsonl`
+  - 选手提交物只允许是 `sgl-kernel` wheel（本镜像会在启动 SGLang 前安装），从而**无法通过修改评测脚本/流程影响正式评测**（评测逻辑由官方镜像固定）
+
+推荐的“先小样本再全量”流程：
+
+- **小样本 sanity check（10 题）**：设置 `PERF_MAX_SAMPLES=10`；速度评测可选（挂载 `speed_bench_c1.jsonl` / `speed_bench_c8.jsonl` 以验证速度链路）
+- **全量 baseline**：不传 `PERF_MAX_SAMPLES`（跑全量）；速度评测同样通过挂载速度数据集启用
 
 ---
 
@@ -407,7 +409,7 @@ docker run ... \
 **可能的 `error_msg` 值**：
 - `评测脚本执行失败`
 - `评测完成但未找到 summary.json`
-- `benchmark_duration 部分失败: S8,Smax 值为 0`
+- `benchmark_duration 部分失败: S1 或 S8 或 Smax 值为 0`
 - `benchmark_duration 获取失败，脚本执行异常`
 - `SGLang 服务启动失败`
 - `SGLang 服务启动超时`
@@ -419,13 +421,13 @@ docker run ... \
 
 | 配置 | 预计耗时 |
 |------|---------|
-| 快速测试（`PERF_MAX_SAMPLES=5, SPEED_MAX_SAMPLES=10`） | 约 12-15 分钟 |
-| 全量运行（180 题 acc + benchmark 128 条 × 3 档） | 约 4-6 小时 |
+| 快速测试（`PERF_MAX_SAMPLES=5`；速度评测可选） | 约 15-30 分钟 |
+| 全量运行（180 题 acc；速度评测启用时为 S1 + S8 + Smax） | 约 2-4 小时 |
 
-**快速测试耗时拆解**（`PERF_MAX_SAMPLES=5, SPEED_MAX_SAMPLES=10`）：
+**快速测试耗时拆解**（`PERF_MAX_SAMPLES=5`）：
 - SGLang 启动（加载模型）：约 2-3 分钟
 - acc 评测（5 题，并发 8）：约 2-3 分钟
-- Benchmark（S1 + S8 + Smax）：约 8 分钟
+- Benchmark（S1 + S8 + Smax）：约 10-30 分钟（取决于速度数据集规模）
 
 建议容器超时设为 **12 小时**。
 
@@ -450,7 +452,7 @@ result = subprocess.run(
         "-e", f"RECORD_ID={record_id}",
         "-e", f"USER_ID={user_id}",
         "-e", f"TASK_ID={task_id}",
-        "modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.4",
+        "modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.5",
     ],
     capture_output=True,
     text=True,
@@ -473,10 +475,10 @@ if json_start is not None:
 
 ## 10. 已知问题与注意事项
 
-1. **`minicpm_flashinfer` + CUDA Graph 在高并发下可能不稳定**：在某些高并发/稀疏注意力场景下，FlashInfer 可能在 CUDA Graph replay 阶段触发内部错误。当前镜像默认 `DISABLE_CUDA_GRAPH=1`（即启动时追加 `--disable-cuda-graph`）以优先保证稳定性；如需尝试更高性能可将 `DISABLE_CUDA_GRAPH=0`（风险自担）。
+1. **Blackwell(sm\_120) 与 `minicpm_flashattn`**：在本机 `sm_120` 上，`minicpm_flashattn` 可能触发 `no kernel image is available for execution on the device`（FlashAttention Hopper kernel 不支持）。建议使用 `minicpm_flashinfer`。
 
 2. **`--disable-radix-cache`**：评测规则要求关闭前缀缓存，这会导致评测速度略慢（每条请求都需要完整 prefill），但不影响评测结果的正确性。
 
-3. **`MAX_RUNNING_REQUESTS` 建议与 benchmark 规模匹配**：全量速度评测默认 128 条请求，建议将 `MAX_RUNNING_REQUESTS=128`，避免服务端并发上限导致排队从而影响 `Smax` 指标。
+3. **`--max-running-requests` 与 Smax 规模**：入口脚本固定 `--max-running-requests 32`。若 `Smax` 数据集条数远大于 32，会出现排队导致 `Smax` 时间变长；建议将 `speed_bench_cunlimited.jsonl` 的条数控制在合理范围（例如 \(\le 32\)），或接受排队对时长的影响。
 
 4. **答案提取**：MCQ 任务使用 `re.search()` 提取第一个 `ANSWER: X` 匹配，与 OpenCompass 官方 `GPQA_Simple_Eval_postprocess` 行为一致。

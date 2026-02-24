@@ -14,18 +14,20 @@
 #   MODEL_PATH         - 模型路径（必须）
 #   PORT               - SGLang 服务端口（默认 30000）
 #   PERF_DATA          - 准确率评测数据集路径（JSONL，默认 /data/perf_public_set.jsonl；切私有集传 /data/perf_private_set.jsonl）
-#   SPEED_DATA         - 速度评测数据集路径（JSONL，默认 /data/speed_eval.jsonl）
 #   RECORD_ID          - 提交记录ID
 #   USER_ID            - 用户ID
 #   TASK_ID            - 任务ID
 #   PERF_MAX_SAMPLES   - 准确率评测最多样本数（可选，默认全部）
-#   SPEED_MAX_SAMPLES  - 速度评测最多数据条数（可选，默认全部）
-#   SGLANG_KERNEL_WHEEL- 选手提交的 sgl-kernel wheel 路径（可选，推荐；优先级高于 INPUT_URL）
-#   SGL_KERNEL_WHEEL   - 同上（兼容旧字段；以 SGL_ 开头会触发 SGLang 的 deprecated 警告，不推荐）
-#   INPUT_URL          - 选手提交文件预签名下载直链（可选，作为 wheel 来源；未传 SGLANG_KERNEL_WHEEL/SGL_KERNEL_WHEEL 时使用）
+#   SGLANG_KERNEL_WHEEL- 选手提交的 sgl-kernel wheel 路径（可选）
+#   SGLANG_SERVER_ARGS - SGLang 服务启动参数（可选；用于调整部署参数）
+#                        默认包含评测/加速相关参数（示例见 README）
+#   SPEED_DATA_SMAX    - 速度评测 Smax(不设并发上限) 数据集路径（可选；默认 /data/speed_bench_cunlimited.jsonl）
 #   SCORE_SYNC_URL     - 分数同步回调地址基址（可选；POST {SCORE_SYNC_URL}/score/sync）
 #   SCORE_SYNC_REQUIRED- 分数同步是否强依赖（可选；默认 0；为 1 时回调失败会置 state=0）
-#   DISABLE_CUDA_GRAPH - 是否禁用 CUDA Graph（可选；默认 1，避免 flashinfer+graph 在高并发下不稳定）
+#   速度评测数据（可选，未提供则跳过速度评测，仅输出 acc）:
+#     - /data/speed_bench_c1.jsonl   (S1 并发=1)
+#     - /data/speed_bench_c8.jsonl   (S8 并发=8)
+#     - /data/speed_bench_cunlimited.jsonl 或 SPEED_DATA_SMAX (Smax 不设并发上限)
 # ============================================================
 set -e
 
@@ -35,28 +37,27 @@ export NO_PROXY="localhost,127.0.0.1"
 MODEL_PATH="${MODEL_PATH:?环境变量 MODEL_PATH 未设置}"
 PORT="${PORT:-30000}"
 PERF_DATA="${PERF_DATA:-/data/perf_public_set.jsonl}"
-SPEED_DATA="${SPEED_DATA:-/data/speed_eval.jsonl}"
 RECORD_ID="${RECORD_ID:-}"
 USER_ID="${USER_ID:-}"
 TASK_ID="${TASK_ID:-}"
 PERF_MAX_SAMPLES="${PERF_MAX_SAMPLES:-}"
-SPEED_MAX_SAMPLES="${SPEED_MAX_SAMPLES:-}"
-GPU_PER_WORKER="${GPU_PER_WORKER:-1}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
-DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 SGLANG_KERNEL_WHEEL="${SGLANG_KERNEL_WHEEL:-}"
-SGL_KERNEL_WHEEL="${SGL_KERNEL_WHEEL:-}"
-INPUT_URL="${INPUT_URL:-}"
+SGLANG_SERVER_ARGS_DEFAULT="--disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse"
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-${SGLANG_SERVER_ARGS_DEFAULT}}"
+SPEED_DATA_SMAX="${SPEED_DATA_SMAX:-/data/speed_bench_cunlimited.jsonl}"
+export SPEED_DATA_SMAX
 SCORE_SYNC_URL="${SCORE_SYNC_URL:-}"
 SCORE_SYNC_REQUIRED="${SCORE_SYNC_REQUIRED:-0}"
 SCORE_SYNC_RETRIES="${SCORE_SYNC_RETRIES:-3}"
 SCORE_SYNC_CONNECT_TIMEOUT="${SCORE_SYNC_CONNECT_TIMEOUT:-5}"
 SCORE_SYNC_TIMEOUT="${SCORE_SYNC_TIMEOUT:-20}"
 
-CUDA_GRAPH_FLAG=""
-if [ "${DISABLE_CUDA_GRAPH}" = "1" ] || [ "${DISABLE_CUDA_GRAPH}" = "true" ]; then
-    CUDA_GRAPH_FLAG="--disable-cuda-graph"
-fi
+# 兼容用户习惯的下划线写法（如 --dense_as_sparse），统一转换为 CLI 的连字符写法
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--dense_as_sparse/--dense-as-sparse}"
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--disable_radix_cache/--disable-radix-cache}"
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--chunked_prefill_size/--chunked-prefill-size}"
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--skip_server_warmup/--skip-server-warmup}"
+SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--attention_backend/--attention-backend}"
 
 API_BASE="http://127.0.0.1:${PORT}"
 VENV_DIR="/opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env"
@@ -218,25 +219,13 @@ install_submission_sgl_kernel() {
     SUBMISSION_ERROR=""
     local wheel_path=""
 
-    if [ -n "${SGLANG_KERNEL_WHEEL}" ]; then
-        wheel_path="${SGLANG_KERNEL_WHEEL}"
-        echo "[entrypoint] 检测到选手 wheel（SGLANG_KERNEL_WHEEL）: ${wheel_path}" >&2
-    elif [ -n "${SGL_KERNEL_WHEEL}" ]; then
-        wheel_path="${SGL_KERNEL_WHEEL}"
-        echo "[entrypoint] 检测到选手 wheel（SGL_KERNEL_WHEEL，deprecated）: ${wheel_path}" >&2
-    elif [ -n "${INPUT_URL}" ]; then
-        wheel_path="/tmp/sgl_kernel_submission.whl"
-        echo "[entrypoint] 未提供 SGLANG_KERNEL_WHEEL / SGL_KERNEL_WHEEL，尝试从 INPUT_URL 下载 wheel ..." >&2
-        echo "  INPUT_URL: ${INPUT_URL}" >&2
-        if ! curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "${wheel_path}" "${INPUT_URL}" 1>&2; then
-            SUBMISSION_ERROR="选手 wheel 下载失败（INPUT_URL）"
-            return 1
-        fi
-        echo "[entrypoint] wheel 已下载到: ${wheel_path}" >&2
-    else
-        echo "[entrypoint] 未提供选手 wheel（SGLANG_KERNEL_WHEEL / SGL_KERNEL_WHEEL / INPUT_URL 均为空），使用镜像内置 sgl-kernel" >&2
+    if [ -z "${SGLANG_KERNEL_WHEEL}" ]; then
+        echo "[entrypoint] 未提供选手 wheel（SGLANG_KERNEL_WHEEL 为空），使用镜像内置 sgl-kernel" >&2
         return 0
     fi
+
+    wheel_path="${SGLANG_KERNEL_WHEEL}"
+    echo "[entrypoint] 检测到选手 wheel（SGLANG_KERNEL_WHEEL）: ${wheel_path}" >&2
 
     if [ ! -f "${wheel_path}" ]; then
         SUBMISSION_ERROR="选手 wheel 不存在: ${wheel_path}"
@@ -425,18 +414,17 @@ echo "[entrypoint] 启动 SGLang 服务 ..."
 echo "  模型路径: ${MODEL_PATH}"
 echo "  端口:     ${PORT}"
 
+if echo " ${SGLANG_SERVER_ARGS} " | grep -qE ' --tp-size | --max-running-requests '; then
+    echo "[entrypoint] [WARN] 检测到 SGLANG_SERVER_ARGS 包含 --tp-size/--max-running-requests；将被入口脚本固定值覆盖（tp=1, max_running_requests=32）" >&2
+fi
+
 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --trust-remote-code \
-    --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
-    --chunked-prefill-size 8192 \
-    --tp-size "${GPU_PER_WORKER}" \
-    --max-running-requests "${MAX_RUNNING_REQUESTS}" \
-    ${CUDA_GRAPH_FLAG} \
-    --skip-server-warmup \
     --port "${PORT}" \
-    --dense-as-sparse \
+    ${SGLANG_SERVER_ARGS} \
+    --tp-size 1 \
+    --max-running-requests 32 \
     --enable-metrics 1>&2 &
 
 SGLANG_PID=$!
@@ -520,40 +508,41 @@ fi
 # ============================================================
 echo "[entrypoint] 运行 benchmark_duration (sglang.bench_serving) ..."
 BENCHMARK_DURATION='{"S1":0,"S8":0,"Smax":0}'
-
-BENCH_ARGS="${API_BASE} ${SPEED_DATA}"
-if [ -n "${SPEED_MAX_SAMPLES}" ]; then
-    BENCH_ARGS="${BENCH_ARGS} ${SPEED_MAX_SAMPLES}"
-    echo "[entrypoint] 速度评测最多使用 ${SPEED_MAX_SAMPLES} 条数据"
-fi
-
-BENCH_OUTPUT=$(bash /app/bench_serving.sh ${BENCH_ARGS} 2>&1) || true
-
-echo "${BENCH_OUTPUT}"
-
-# 取最后一行作为 benchmark_duration JSON
-BENCH_RESULT=$(echo "${BENCH_OUTPUT}" | tail -1)
-
 BENCH_ERROR=""
-if [ -n "${BENCH_RESULT}" ] && echo "${BENCH_RESULT}" | python3 -c "import json,sys; json.loads(sys.stdin.read())" 2>/dev/null; then
-    BENCHMARK_DURATION="${BENCH_RESULT}"
-    echo "[entrypoint] benchmark_duration: ${BENCHMARK_DURATION}"
 
-    # 检查是否有档位失败（值为 0）
-    FAILED_LEVELS=$(python3 -c "
+SPEED_BENCH_S1="/data/speed_bench_c1.jsonl"
+SPEED_BENCH_S8="/data/speed_bench_c8.jsonl"
+SPEED_BENCH_SMAX="${SPEED_DATA_SMAX}"
+
+if [ -f "${SPEED_BENCH_S1}" ] && [ -f "${SPEED_BENCH_S8}" ] && [ -f "${SPEED_BENCH_SMAX}" ]; then
+    BENCH_OUTPUT=$(bash /app/bench_serving.sh "${API_BASE}" 2>&1) || true
+    echo "${BENCH_OUTPUT}"
+
+    # 取最后一行作为 benchmark_duration JSON
+    BENCH_RESULT=$(echo "${BENCH_OUTPUT}" | tail -1)
+
+    if [ -n "${BENCH_RESULT}" ] && echo "${BENCH_RESULT}" | python3 -c "import json,sys; json.loads(sys.stdin.read())" 2>/dev/null; then
+        BENCHMARK_DURATION="${BENCH_RESULT}"
+        echo "[entrypoint] benchmark_duration: ${BENCHMARK_DURATION}"
+
+        # 检查是否有档位失败（值为 0）
+        FAILED_LEVELS=$(python3 -c "
 import json
 result = json.loads('${BENCHMARK_DURATION}')
 failed = [k for k in ['S1', 'S8', 'Smax'] if result.get(k, 0) == 0]
 if failed:
     print(','.join(failed))
 ")
-    if [ -n "${FAILED_LEVELS}" ]; then
-        BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS} 值为 0"
-        echo "[entrypoint] [WARN] ${BENCH_ERROR}"
+        if [ -n "${FAILED_LEVELS}" ]; then
+            BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS} 值为 0"
+            echo "[entrypoint] [WARN] ${BENCH_ERROR}"
+        fi
+    else
+        BENCH_ERROR="benchmark_duration 获取失败，脚本执行异常"
+        echo "[entrypoint] [ERROR] ${BENCH_ERROR}"
     fi
 else
-    BENCH_ERROR="benchmark_duration 获取失败，脚本执行异常"
-    echo "[entrypoint] [ERROR] ${BENCH_ERROR}"
+    echo "[entrypoint] 未提供速度评测数据集（${SPEED_BENCH_S1} / ${SPEED_BENCH_S8} / ${SPEED_BENCH_SMAX}），跳过速度评测" >&2
 fi
 
 # ============================================================
