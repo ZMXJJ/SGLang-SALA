@@ -27,6 +27,8 @@
 #   TASK_ID            - 任务ID
 #   PERF_MAX_SAMPLES   - 准确率评测最多样本数（可选，默认全部）
 #   SGLANG_KERNEL_WHEEL- 选手提交的 sgl-kernel wheel 路径（可选）
+#   SUBMISSION_TAR     - 选手提交的扩展 tar 包路径（可选；解压后若包含 run.py 则会在启动 SGLang 前执行）
+#   SUBMISSION_RUN_REL_PATH - 指定要执行的 run.py 相对路径（可选；用于 tar 内存在多个 run.py 的情况）
 #   SGLANG_SERVER_ARGS - SGLang 服务启动参数（可选；用于调整部署参数）
 #                        默认包含评测/加速相关参数（示例见 README）
 #   SPEED_DATA_S1      - 速度评测 S1(并发=1) 数据集路径（为保证评测一致性，本脚本内固定写死；外部传入会被忽略）
@@ -39,7 +41,7 @@
 #   速度评测数据（可选，未提供则跳过速度评测，仅输出 acc）:
 #     - /data/speed_bench_c1.jsonl   (S1 并发=1)
 #     - /data/speed_bench_c8.jsonl   (S8 并发=8)
-#     - /data/speed_bench_cunlimited.jsonl 或 SPEED_DATA_SMAX (Smax 不设并发上限)
+#     - /data/speed_bench_cunlimited.jsonl (Smax 不设并发上限)
 # ============================================================
 set -e
 
@@ -55,6 +57,8 @@ TASK_ID="${TASK_ID:-}"
 export RECORD_ID USER_ID TASK_ID
 PERF_MAX_SAMPLES="${PERF_MAX_SAMPLES:-}"
 SGLANG_KERNEL_WHEEL="${SGLANG_KERNEL_WHEEL:-}"
+SUBMISSION_TAR="${SUBMISSION_TAR:-}"
+SUBMISSION_RUN_REL_PATH="${SUBMISSION_RUN_REL_PATH:-}"
 SGLANG_SERVER_ARGS_DEFAULT="--disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse"
 SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-${SGLANG_SERVER_ARGS_DEFAULT}}"
 
@@ -82,12 +86,15 @@ SCORE_SYNC_RETRIES="${SCORE_SYNC_RETRIES:-3}"
 SCORE_SYNC_CONNECT_TIMEOUT="${SCORE_SYNC_CONNECT_TIMEOUT:-5}"
 SCORE_SYNC_TIMEOUT="${SCORE_SYNC_TIMEOUT:-20}"
 
-# 兼容用户习惯的下划线写法（如 --dense_as_sparse），统一转换为 CLI 的连字符写法
-SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--dense_as_sparse/--dense-as-sparse}"
-SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--disable_radix_cache/--disable-radix-cache}"
-SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--chunked_prefill_size/--chunked-prefill-size}"
-SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--skip_server_warmup/--skip-server-warmup}"
-SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--attention_backend/--attention-backend}"
+normalize_server_args() {
+    # 兼容用户习惯的下划线写法（如 --dense_as_sparse），统一转换为 CLI 的连字符写法
+    SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--dense_as_sparse/--dense-as-sparse}"
+    SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--disable_radix_cache/--disable-radix-cache}"
+    SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--chunked_prefill_size/--chunked-prefill-size}"
+    SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--skip_server_warmup/--skip-server-warmup}"
+    SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--attention_backend/--attention-backend}"
+}
+normalize_server_args
 
 API_BASE="http://127.0.0.1:${PORT}"
 VENV_DIR="/opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env"
@@ -113,6 +120,8 @@ meta = {
     "perf_data": os.environ.get("PERF_DATA", ""),
     "sglang_server_args": os.environ.get("SGLANG_SERVER_ARGS", ""),
     "sglang_kernel_wheel": os.environ.get("SGLANG_KERNEL_WHEEL", ""),
+    "submission_tar": os.environ.get("SUBMISSION_TAR", ""),
+    "submission_run_rel_path": os.environ.get("SUBMISSION_RUN_REL_PATH", ""),
     "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
     "start_epoch": int(time.time()),
 }
@@ -299,6 +308,7 @@ output_result() {
 
 # ---- 函数: 安装选手提交的 sgl-kernel wheel（可选）----
 SUBMISSION_ERROR=""
+SUBMISSION_TAR_EXTRACT_DIR=""
 install_submission_sgl_kernel() {
     SUBMISSION_ERROR=""
     local wheel_path=""
@@ -508,6 +518,238 @@ PY
     return 0
 }
 
+# ---- 函数: 解压并执行选手提交的 run.py（可选）----
+run_submission_tar_hook() {
+    SUBMISSION_ERROR=""
+
+    if [ -z "${SUBMISSION_TAR}" ]; then
+        return 0
+    fi
+
+    echo "[entrypoint] 检测到选手提交 tar（SUBMISSION_TAR）: ${SUBMISSION_TAR}" >&2
+
+    if [ ! -f "${SUBMISSION_TAR}" ]; then
+        SUBMISSION_ERROR="选手提交 tar 不存在: ${SUBMISSION_TAR}"
+        return 1
+    fi
+
+    local extract_dir=""
+    extract_dir="$(mktemp -d /tmp/soar_submission_XXXXXX 2>/dev/null || true)"
+    if [ -z "${extract_dir}" ]; then
+        extract_dir="/tmp/soar_submission_$$"
+        rm -rf "${extract_dir}" 2>/dev/null || true
+        mkdir -p "${extract_dir}" 2>/dev/null || true
+    fi
+    SUBMISSION_TAR_EXTRACT_DIR="${extract_dir}"
+
+    echo "[entrypoint] 解压选手 tar 到: ${extract_dir}" >&2
+    if ! python3 - "${SUBMISSION_TAR}" "${extract_dir}" <<'PY' 1>&2; then
+import os
+import sys
+import tarfile
+
+tar_path = sys.argv[1]
+dest_dir = sys.argv[2]
+
+os.makedirs(dest_dir, exist_ok=True)
+
+def is_within_directory(directory: str, target: str) -> bool:
+    abs_directory = os.path.abspath(directory)
+    abs_target = os.path.abspath(target)
+    return os.path.commonpath([abs_directory, abs_target]) == abs_directory
+
+try:
+    tf = tarfile.open(tar_path, "r:*")
+except Exception as e:
+    print(f"[entrypoint] [ERROR] 无法打开 tar: {tar_path} ({e})", file=sys.stderr)
+    sys.exit(1)
+
+with tf:
+    members = tf.getmembers()
+    for m in members:
+        name = m.name or ""
+        if name.startswith("./"):
+            name = name[2:]
+        norm = os.path.normpath(name)
+        if norm in ("", ".", "/"):
+            continue
+        if os.path.isabs(norm) or any(part == ".." for part in norm.split(os.sep)):
+            print(f"[entrypoint] [ERROR] tar 内含不安全路径: {m.name}", file=sys.stderr)
+            sys.exit(1)
+        if m.issym() or m.islnk():
+            print(f"[entrypoint] [ERROR] tar 内含 link（不允许）: {m.name}", file=sys.stderr)
+            sys.exit(1)
+        if m.ischr() or m.isblk() or m.isfifo():
+            print(f"[entrypoint] [ERROR] tar 内含特殊文件（不允许）: {m.name}", file=sys.stderr)
+            sys.exit(1)
+
+        target_path = os.path.join(dest_dir, norm)
+        if not is_within_directory(dest_dir, target_path):
+            print(f"[entrypoint] [ERROR] tar 路径穿越: {m.name}", file=sys.stderr)
+            sys.exit(1)
+
+    tf.extractall(dest_dir)
+
+print(f"[entrypoint] tar 解压完成: {dest_dir}", file=sys.stderr)
+PY
+        SUBMISSION_ERROR="选手提交 tar 解压失败: ${SUBMISSION_TAR}"
+        return 1
+    fi
+
+    local run_py=""
+    if [ -n "${SUBMISSION_RUN_REL_PATH}" ]; then
+        if [[ "${SUBMISSION_RUN_REL_PATH}" = /* ]] || [[ "${SUBMISSION_RUN_REL_PATH}" == *".."* ]]; then
+            SUBMISSION_ERROR="SUBMISSION_RUN_REL_PATH 不合法（必须为相对路径且不能包含 .. ）: ${SUBMISSION_RUN_REL_PATH}"
+            return 1
+        fi
+        run_py="${extract_dir}/${SUBMISSION_RUN_REL_PATH}"
+        if [ ! -f "${run_py}" ]; then
+            SUBMISSION_ERROR="SUBMISSION_RUN_REL_PATH 指定的脚本不存在: ${SUBMISSION_RUN_REL_PATH}"
+            return 1
+        fi
+    elif [ -f "${extract_dir}/run.py" ]; then
+        run_py="${extract_dir}/run.py"
+    else
+        run_py="$(python3 - "${extract_dir}" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+
+try:
+    root_run = os.path.join(root, "run.py")
+    if os.path.isfile(root_run):
+        print(root_run)
+        raise SystemExit(0)
+
+    candidates = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # 过滤掉常见无关目录，避免误选/加速遍历
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in ("__pycache__", ".git", ".svn") and not d.startswith(".")
+        ]
+        if "run.py" in filenames:
+            candidates.append(os.path.join(dirpath, "run.py"))
+
+    if not candidates:
+        print("")
+        raise SystemExit(0)
+
+    if len(candidates) > 1:
+        print("__MULTIPLE__")
+        print(
+            "[entrypoint] [ERROR] tar 中发现多个 run.py，请通过 SUBMISSION_RUN_REL_PATH 指定要执行的脚本（相对解压根目录）:",
+            file=sys.stderr,
+        )
+        for p in sorted(candidates)[:50]:
+            rel = os.path.relpath(p, root)
+            print(f"  - {rel}", file=sys.stderr)
+        raise SystemExit(0)
+
+    print(candidates[0])
+except Exception as e:
+    print("__ERROR__")
+    print(f"[entrypoint] [ERROR] 扫描 run.py 失败: {e}", file=sys.stderr)
+    raise SystemExit(0)
+PY
+)"
+    fi
+
+    if [ "${run_py}" = "__ERROR__" ]; then
+        SUBMISSION_ERROR="扫描 run.py 失败（请检查 SUBMISSION_TAR 内容）"
+        return 1
+    fi
+    if [ "${run_py}" = "__MULTIPLE__" ]; then
+        SUBMISSION_ERROR="tar 中发现多个 run.py，请使用 SUBMISSION_RUN_REL_PATH 指定"
+        return 1
+    fi
+
+    if [ -z "${run_py}" ]; then
+        echo "[entrypoint] tar 解压完成，但未发现 run.py，跳过选手预处理步骤" >&2
+        return 0
+    fi
+
+    echo "[entrypoint] 运行选手预处理脚本: ${run_py}" >&2
+
+    local result_json="${extract_dir}/soar_result.json"
+    export SOAR_SUBMISSION_TAR="${SUBMISSION_TAR}"
+    export SOAR_SUBMISSION_DIR="${extract_dir}"
+    export SOAR_ORIG_MODEL_PATH="${MODEL_PATH}"
+    export SOAR_MODEL_PATH="${MODEL_PATH}"
+    export SOAR_SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS}"
+    export SOAR_RESULT_JSON="${result_json}"
+    export SOAR_LOG_DIR="${LOG_DIR}"
+    export SOAR_LOG_FILE="${LOG_FILE}"
+
+    local run_dir=""
+    run_dir="$(dirname "${run_py}")"
+    if ! (cd "${run_dir}" && python3 "$(basename "${run_py}")"); then
+        SUBMISSION_ERROR="选手预处理脚本执行失败: ${run_py}"
+        return 1
+    fi
+
+    if [ ! -f "${result_json}" ]; then
+        echo "[entrypoint] [submission] run.py 未生成结果文件（SOAR_RESULT_JSON=${result_json}），保持默认 MODEL_PATH/SGLANG_SERVER_ARGS" >&2
+        return 0
+    fi
+
+    if ! python3 -c "import json,sys; json.load(open(sys.argv[1], 'r', encoding='utf-8'))" "${result_json}" 2>/dev/null; then
+        SUBMISSION_ERROR="选手预处理脚本输出的结果 JSON 无法解析: ${result_json}"
+        return 1
+    fi
+
+    local new_model_path=""
+    local new_server_args=""
+    local new_server_args_append=""
+    readarray -t _SUBMISSION_OUT < <(python3 - "${result_json}" <<'PY'
+import json
+import sys
+
+p = sys.argv[1]
+with open(p, "r", encoding="utf-8") as f:
+    obj = json.load(f) or {}
+
+def get_str(key: str) -> str:
+    v = obj.get(key, "")
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        v = str(v)
+    return v.replace("\\n", " ").strip()
+
+print(get_str("model_path"))
+print(get_str("sglang_server_args"))
+print(get_str("sglang_server_args_append"))
+PY
+)
+    new_model_path="${_SUBMISSION_OUT[0]:-}"
+    new_server_args="${_SUBMISSION_OUT[1]:-}"
+    new_server_args_append="${_SUBMISSION_OUT[2]:-}"
+
+    if [ -n "${new_model_path}" ]; then
+        if [ -d "${new_model_path}" ] || [ -f "${new_model_path}" ]; then
+            MODEL_PATH="${new_model_path}"
+            export MODEL_PATH
+            echo "[entrypoint] [submission] MODEL_PATH 已更新为: ${MODEL_PATH}" >&2
+        else
+            echo "[entrypoint] [WARN] run.py 返回 model_path 但路径不存在: ${new_model_path}，忽略" >&2
+        fi
+    fi
+
+    if [ -n "${new_server_args}" ]; then
+        SGLANG_SERVER_ARGS="${new_server_args}"
+        echo "[entrypoint] [submission] SGLANG_SERVER_ARGS 已被 run.py 覆盖" >&2
+    elif [ -n "${new_server_args_append}" ]; then
+        SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS} ${new_server_args_append}"
+        echo "[entrypoint] [submission] SGLANG_SERVER_ARGS 已追加 run.py 参数" >&2
+    fi
+    normalize_server_args
+
+    echo "[entrypoint] [submission] 最终 SGLANG_SERVER_ARGS: ${SGLANG_SERVER_ARGS}" >&2
+    return 0
+}
+
 # ---- 函数: 清理 SGLang 进程 ----
 cleanup() {
     if [ -n "${SGLANG_PID:-}" ] && kill -0 "${SGLANG_PID}" 2>/dev/null; then
@@ -536,6 +778,9 @@ with open(sys.argv[1], "w") as f:
 PYEXIT
     fi
     cleanup
+    if [ -n "${SUBMISSION_TAR_EXTRACT_DIR:-}" ] && [ -d "${SUBMISSION_TAR_EXTRACT_DIR}" ]; then
+        rm -rf "${SUBMISSION_TAR_EXTRACT_DIR}" 2>/dev/null || true
+    fi
 }
 
 # ---- 函数: 检查 SGLang 服务是否可用 ----
@@ -598,6 +843,14 @@ status_callback 30 "正在下载并安装选手提交内容"
 
 echo "[entrypoint] 检查并安装选手 sgl-kernel 提交内容（如有）..."
 if ! install_submission_sgl_kernel; then
+    echo "[entrypoint] [ERROR] ${SUBMISSION_ERROR}" >&2
+    status_callback -1 "任务失败: ${SUBMISSION_ERROR}"
+    output_result "0" "${SUBMISSION_ERROR}" "0" '{"S1":0,"S8":0,"Smax":0}'
+    exit 1
+fi
+
+echo "[entrypoint] 检查并运行选手预处理脚本（如有）..."
+if ! run_submission_tar_hook; then
     echo "[entrypoint] [ERROR] ${SUBMISSION_ERROR}" >&2
     status_callback -1 "任务失败: ${SUBMISSION_ERROR}"
     output_result "0" "${SUBMISSION_ERROR}" "0" '{"S1":0,"S8":0,"Smax":0}'

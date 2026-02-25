@@ -134,7 +134,7 @@ python3 -m sglang.launch_server \
 | `Smax` | 不设 `--max-concurrency` | 无并发上限，全部请求同时发送 |
 
 - 每档测试前清除 prefix cache（`--flush-cache`）
-- 使用 `speed_bench_c1.jsonl`（S1）、`speed_bench_c8.jsonl`（S8），以及 `SPEED_DATA_SMAX` 指定的数据集（默认 `/data/speed_bench_cunlimited.jsonl`；用于 Smax）；若未提供这三者则**跳过速度评测**
+- 使用固定速度数据集：`/data/speed_bench_c1.jsonl`（S1）、`/data/speed_bench_c8.jsonl`（S8）、`/data/speed_bench_cunlimited.jsonl`（Smax）。入口脚本会忽略外部对 `SPEED_DATA_*` 的覆盖以保证评测口径一致；若三者任一文件缺失则**跳过速度评测**
 
 **工作流程**：
 
@@ -151,16 +151,18 @@ python3 -m sglang.launch_server \
 
 ```
 1. 激活 sglang_minicpm_sala_env 虚拟环境
-2. 后台启动 SGLang 推理服务
-3. 等待服务就绪（轮询 /health + /v1/models，最多等 10 分钟）
-4. 运行 eval_model.py，评测准确率，获取 acc
-5. 运行 bench_serving.sh，在 3 档并发度下测量推理速度，获取 benchmark_duration
-6. 组装最终 JSON 结果输出到 stdout
-7. 关闭 SGLang 服务，容器退出
+2. （可选）安装选手提交的 sgl-kernel wheel / 执行 SUBMISSION_TAR 中的 run.py 预处理
+3. 后台启动 SGLang 推理服务
+4. 等待服务就绪（轮询 /health + /v1/models，最多等 10 分钟）
+5. 运行 eval_model.py，评测准确率，获取 acc
+6. 运行 bench_serving.sh，在 3 档并发度下测量推理速度，获取 benchmark_duration
+7. 组装最终 JSON 结果输出到 stdout
+8. 关闭 SGLang 服务，容器退出
 ```
 
 **错误处理**：
 - SGLang 启动失败或超时 → `state=0`，输出错误信息
+- 选手预处理脚本（run.py）失败 → `state=0`，`error_msg` 包含错误描述
 - 评测失败 → `state=0`，`error_msg` 包含错误描述
 - Benchmark 失败（某档位 duration=0）→ `state=0`，`error_msg` 包含 benchmark 错误
 - 评测和 benchmark 同时失败 → 错误信息用 `;` 连接
@@ -244,18 +246,22 @@ docker run --gpus '"device=0,1"' ...
 | `PERF_DATA` | 否 | `/data/perf_public_set.jsonl` | 准确率评测数据集路径（JSONL）；切私有集可传 `/data/perf_private_set.jsonl` |
 | `PERF_MAX_SAMPLES` | 否 | 空 | 准确率评测最多样本数（调试用，不传则跑全量） |
 | `SGLANG_SERVER_ARGS` | 否 | `--disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse` | SGLang 服务启动参数（用于调整除 tp/max_running_requests 以外的大部分参数；入口脚本固定 `--tp-size 1`、`--max-running-requests 32`） |
-| `SPEED_DATA_SMAX` | 否 | `/data/speed_bench_cunlimited.jsonl` | 速度评测 Smax 档位数据集路径（不设并发上限） |
+| `SPEED_DATA_S1` | 否 | `/data/speed_bench_c1.jsonl` | 速度评测 S1 档位数据集路径（为保证评测一致性，入口脚本内固定写死；外部设置会被忽略） |
+| `SPEED_DATA_S8` | 否 | `/data/speed_bench_c8.jsonl` | 速度评测 S8 档位数据集路径（为保证评测一致性，入口脚本内固定写死；外部设置会被忽略） |
+| `SPEED_DATA_SMAX` | 否 | `/data/speed_bench_cunlimited.jsonl` | 速度评测 Smax 档位数据集路径（为保证评测一致性，入口脚本内固定写死；外部设置会被忽略） |
 | `RECORD_ID` | 是 | 空 | 提交记录 ID |
 | `USER_ID` | 是 | 空 | 用户 ID |
 | `TASK_ID` | 是 | 空 | 任务 ID |
 | `SGLANG_KERNEL_WHEEL` | 否 | 空 | 选手提交的 `sgl-kernel` wheel 路径 |
+| `SUBMISSION_TAR` | 否 | 空 | 选手扩展提交 tar 包路径（可选；入口脚本会安全解压，并在启动 SGLang 前执行其中的 `run.py`（若存在），用于量化/投机采样等预处理） |
+| `SUBMISSION_RUN_REL_PATH` | 否 | 空 | tar 内存在多个 `run.py` 时，指定要执行脚本的相对路径（相对解压根目录） |
 | `SCORE_SYNC_URL` | 否 | 空 | 分数同步回调基址（POST `{SCORE_SYNC_URL}/score/sync`） |
 | `SCORE_SYNC_REQUIRED` | 否 | `0` | 为 `1` 时回调失败会置 `state=0`；为 `0` 时仅 stderr 警告，评测仍按实际结果输出 |
 | `SCORE_SYNC_RETRIES` | 否 | `3` | 分数同步重试次数 |
 | `SCORE_SYNC_CONNECT_TIMEOUT` | 否 | `5` | 分数同步连接超时（秒） |
 | `SCORE_SYNC_TIMEOUT` | 否 | `20` | 分数同步总超时（秒） |
 
-**速度评测启用方式**：当容器内同时存在 `/data/speed_bench_c1.jsonl`、`/data/speed_bench_c8.jsonl`，以及 `SPEED_DATA_SMAX` 指向的文件（默认 `/data/speed_bench_cunlimited.jsonl`）时，才会运行速度评测并输出 `S1/S8/Smax`，否则跳过速度评测（值为 0）。
+**速度评测启用方式**：当容器内同时存在 `/data/speed_bench_c1.jsonl`、`/data/speed_bench_c8.jsonl`、`/data/speed_bench_cunlimited.jsonl` 时，才会运行速度评测并输出 `S1/S8/Smax`，否则跳过速度评测（值为 0）。入口脚本会忽略外部对 `SPEED_DATA_*` 的覆盖，以保证评测口径一致。
 
 ---
 
@@ -266,6 +272,7 @@ docker run --gpus '"device=0,1"' ...
 | 模型目录 | `/home/user/linbiyuan/models/MiniCPM-SALA` | 模型权重文件 |
 | 数据目录 | `/data` | 包含 `perf_public_set.jsonl` / `perf_private_set.jsonl`；可选包含 `speed_bench_c1.jsonl` / `speed_bench_c8.jsonl` / `speed_bench_cunlimited.jsonl`（用于速度评测） |
 | 选手 wheel（可选） | 例如 `/submission/sgl-kernel.whl` | 配合 `SGLANG_KERNEL_WHEEL` 使用 |
+| 选手 tar（可选） | 例如 `/submission/submission.tar.gz` | 配合 `SUBMISSION_TAR` 使用（解压后若包含 `run.py` 会在启动 SGLang 前执行） |
 
 ### 数据集格式
 
@@ -322,6 +329,68 @@ docker run --gpus all \
 - wheel 只允许包含 `sgl_kernel/` 以及 `sgl_kernel-*.dist-info/`、`sgl_kernel-*.data/`、`sgl_kernel.libs/` 等必要文件；禁止 `.pth` 与其它顶层包
 - 安装采用 `pip install --no-deps --force-reinstall`，避免选手替换 Torch / FlashInfer / SGLang 等依赖（保证公平与可复现）
 
+### 方式 B：挂载 tar（可选扩展：run.py 预处理）
+
+当你希望让选手在 **启动 SGLang 之前**做一次“预处理/离线优化”（例如量化权重生成、准备投机采样草稿模型、生成/选择启动参数等），可以额外挂载一个 tar 包并设置 `SUBMISSION_TAR`。
+
+入口脚本会：
+
+1. 将 `SUBMISSION_TAR` 安全解压到 `/tmp/soar_submission_XXXXXX`
+2. 若解压后存在 `run.py`（默认优先 `/tmp/soar_submission_XXXXXX/run.py`；若有多个则需要 `SUBMISSION_RUN_REL_PATH` 指定），则执行该脚本
+3. 执行时会向 `run.py` 传入一组环境变量（便于脚本读取输入/写回结果）：
+   - `SOAR_SUBMISSION_DIR`：解压目录
+   - `SOAR_SUBMISSION_TAR`：tar 路径
+   - `SOAR_ORIG_MODEL_PATH`：原始 `MODEL_PATH`
+   - `SOAR_MODEL_PATH`：当前 `MODEL_PATH`
+   - `SOAR_SGLANG_SERVER_ARGS`：当前 `SGLANG_SERVER_ARGS`
+   - `SOAR_RESULT_JSON`：结果 JSON 文件路径（`run.py` 可选写入；入口脚本会读取并应用）
+4. 若 `SOAR_RESULT_JSON` 存在且为合法 JSON，入口脚本会读取并应用以下字段（均为可选）：
+   - `model_path`：更新后续启动 SGLang 使用的 `MODEL_PATH`
+   - `sglang_server_args`：覆盖后续启动 SGLang 使用的 `SGLANG_SERVER_ARGS`
+   - `sglang_server_args_append`：在原 `SGLANG_SERVER_ARGS` 基础上追加参数
+
+最小运行示例：
+
+```bash
+docker run --gpus all \
+  -v /path/to/model:/home/user/linbiyuan/models/MiniCPM-SALA:ro \
+  -v /path/to/data:/data:ro \
+  -v /path/to/submission.tar.gz:/submission/submission.tar.gz:ro \
+  -e MODEL_PATH=/home/user/linbiyuan/models/MiniCPM-SALA \
+  -e PERF_DATA=/data/perf_public_set.jsonl \
+  -e SUBMISSION_TAR=/submission/submission.tar.gz \
+  -e RECORD_ID=record_001 \
+  -e USER_ID=user_001 \
+  -e TASK_ID=task_001 \
+  modelbest-registry.cn-beijing.cr.aliyuncs.com/openbmb/sglang_test:2.0.5
+```
+
+`run.py` 最小示例（仅示意：读取输入并写回 `SOAR_RESULT_JSON`）：
+
+```python
+import json
+import os
+
+result_path = os.environ.get("SOAR_RESULT_JSON", "")
+model_path = os.environ.get("SOAR_MODEL_PATH", "")
+server_args = os.environ.get("SOAR_SGLANG_SERVER_ARGS", "")
+
+# TODO: 在这里做量化/准备草稿模型/生成参数等工作
+# 例如：把量化后的模型写到 /tmp/quantized_model，并返回新的 model_path
+
+if result_path:
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                # "model_path": "/tmp/quantized_model",
+                "sglang_server_args_append": "--disable-cuda-graph",
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+```
+
 ---
 
 ## 6.2 公开集 / 私有集切换机制（方便自测，不影响正式评测）
@@ -335,7 +404,7 @@ docker run --gpus all \
 - **正式评测（私有集）**：
   - 平台侧将 `perf_private_set.jsonl`（不对外公开）挂载到容器 `/data/perf_private_set.jsonl`
   - 平台侧设置 `PERF_DATA=/data/perf_private_set.jsonl`
-  - 选手提交物只允许是 `sgl-kernel` wheel（本镜像会在启动 SGLang 前安装），从而**无法通过修改评测脚本/流程影响正式评测**（评测逻辑由官方镜像固定）
+  - 是否开放 `SUBMISSION_TAR` 由平台侧规则决定；若不开放，则选手提交物只允许是 `sgl-kernel` wheel（本镜像会在启动 SGLang 前安装），评测逻辑由官方镜像固定
 
 推荐的“先小样本再全量”流程：
 
