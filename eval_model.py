@@ -429,7 +429,7 @@ def main():
             "record_id": record_id,
             "user_id": user_id,
             "ori_accuracy": round(avg_score, 2),
-            "overall_accuracy": round(avg_score / 81 * 100, 2) ,
+            "overall_accuracy": round(avg_score / 80 * 100, 2) ,
             "duration": duration,
             "total_tokens": total_output_tokens
         }, f, ensure_ascii=False, indent=2)
