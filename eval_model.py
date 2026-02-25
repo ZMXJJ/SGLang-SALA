@@ -327,9 +327,6 @@ def main():
         concurrency=args.concurrency,
         generation_kwargs={
             "temperature": 0.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "min_p": 0,
         },
         chat_template_kwargs={"enable_thinking": True},
         mode='mid',
