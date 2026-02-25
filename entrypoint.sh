@@ -52,6 +52,7 @@ PERF_DATA="${PERF_DATA:-/data/perf_public_set.jsonl}"
 RECORD_ID="${RECORD_ID:-}"
 USER_ID="${USER_ID:-}"
 TASK_ID="${TASK_ID:-}"
+export RECORD_ID USER_ID TASK_ID
 PERF_MAX_SAMPLES="${PERF_MAX_SAMPLES:-}"
 SGLANG_KERNEL_WHEEL="${SGLANG_KERNEL_WHEEL:-}"
 SGLANG_SERVER_ARGS_DEFAULT="--disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse"
@@ -90,6 +91,39 @@ SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--attention_backend/--attention-backen
 
 API_BASE="http://127.0.0.1:${PORT}"
 VENV_DIR="/opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env"
+
+# ---- 日志持久化（尽早创建，即使后续崩溃也能追溯）----
+LOG_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_DIR_NAME="${RECORD_ID:-no_record}_${TASK_ID:-no_task}_${USER_ID:-no_user}"
+LOG_DIR="outputs/${LOG_DIR_NAME}"
+mkdir -p "${LOG_DIR}" 2>/dev/null || LOG_DIR="/tmp/entrypoint_logs_${LOG_TIMESTAMP}"
+mkdir -p "${LOG_DIR}" 2>/dev/null || true
+LOG_FILE="${LOG_DIR}/entrypoint.log"
+export LOG_DIR LOG_FILE
+
+# 立即写入任务元信息
+python3 - "${LOG_DIR}/metadata.json" <<'PYMETA' 2>/dev/null || true
+import json, os, sys, time
+meta = {
+    "record_id": os.environ.get("RECORD_ID", ""),
+    "user_id": os.environ.get("USER_ID", ""),
+    "task_id": os.environ.get("TASK_ID", ""),
+    "model_path": os.environ.get("MODEL_PATH", ""),
+    "port": os.environ.get("PORT", "30000"),
+    "perf_data": os.environ.get("PERF_DATA", ""),
+    "sglang_server_args": os.environ.get("SGLANG_SERVER_ARGS", ""),
+    "sglang_kernel_wheel": os.environ.get("SGLANG_KERNEL_WHEEL", ""),
+    "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "start_epoch": int(time.time()),
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(meta, f, ensure_ascii=False, indent=2)
+PYMETA
+
+echo "[entrypoint] 日志目录: ${LOG_DIR}" >&2
+
+# 将 stdout/stderr 同步写入日志文件（不影响原有输出行为）
+exec > >(tee -a "${LOG_FILE}") 2> >(tee -a "${LOG_FILE}" >&2)
 
 # ---- 函数: 状态回调（best-effort, POST {SCORE_SYNC_URL}/eval/callback）----
 status_callback() {
@@ -274,12 +308,50 @@ install_submission_sgl_kernel() {
         return 0
     fi
 
-    wheel_path="${SGLANG_KERNEL_WHEEL}"
-    echo "[entrypoint] 检测到选手 wheel（SGLANG_KERNEL_WHEEL）: ${wheel_path}" >&2
+    local submission_path="${SGLANG_KERNEL_WHEEL}"
+    echo "[entrypoint] 检测到选手提交文件（SGLANG_KERNEL_WHEEL）: ${submission_path}" >&2
 
-    if [ ! -f "${wheel_path}" ]; then
-        SUBMISSION_ERROR="选手 wheel 不存在: ${wheel_path}"
+    if [ ! -f "${submission_path}" ]; then
+        SUBMISSION_ERROR="选手提交文件不存在: ${submission_path}"
         return 1
+    fi
+
+    # 如果是 tar.gz / tgz 压缩包，先解压再查找 .whl 文件
+    if echo "${submission_path}" | grep -qiE '\.(tar\.gz|tgz)$'; then
+        echo "[entrypoint] 检测到 tar.gz 压缩包，开始解压 ..." >&2
+        local extract_dir="/tmp/sgl_kernel_extract_$$"
+        rm -rf "${extract_dir}"
+        mkdir -p "${extract_dir}"
+
+        if ! tar xzf "${submission_path}" -C "${extract_dir}" 2>&1; then
+            SUBMISSION_ERROR="tar.gz 解压失败: ${submission_path}"
+            return 1
+        fi
+
+        echo "[entrypoint] 解压完成，查找 .whl 文件 ..." >&2
+        local found_wheels=()
+        while IFS= read -r -d '' f; do
+            found_wheels+=("$f")
+        done < <(find "${extract_dir}" -type f -name '*.whl' -print0 2>/dev/null)
+
+        if [ ${#found_wheels[@]} -eq 0 ]; then
+            SUBMISSION_ERROR="tar.gz 中未找到 .whl 文件"
+            echo "[entrypoint] [ERROR] ${SUBMISSION_ERROR}，解压目录内容:" >&2
+            ls -lR "${extract_dir}" >&2 || true
+            return 1
+        fi
+
+        if [ ${#found_wheels[@]} -gt 1 ]; then
+            echo "[entrypoint] [WARN] tar.gz 中包含多个 .whl 文件，使用第一个:" >&2
+            for w in "${found_wheels[@]}"; do
+                echo "  - ${w}" >&2
+            done
+        fi
+
+        wheel_path="${found_wheels[0]}"
+        echo "[entrypoint] 从压缩包中提取 wheel: ${wheel_path}" >&2
+    else
+        wheel_path="${submission_path}"
     fi
 
     echo "[entrypoint] 校验 wheel 内容（仅允许 sgl-kernel）..." >&2
@@ -438,12 +510,32 @@ PY
 
 # ---- 函数: 清理 SGLang 进程 ----
 cleanup() {
-    if [ -n "${SGLANG_PID}" ] && kill -0 "${SGLANG_PID}" 2>/dev/null; then
+    if [ -n "${SGLANG_PID:-}" ] && kill -0 "${SGLANG_PID}" 2>/dev/null; then
         echo "[entrypoint] 正在关闭 SGLang 服务 (PID: ${SGLANG_PID}) ..." >&2
         kill "${SGLANG_PID}" 2>/dev/null || true
         wait "${SGLANG_PID}" 2>/dev/null || true
         echo "[entrypoint] SGLang 服务已关闭" >&2
     fi
+}
+
+# ---- 函数: 退出处理（记录退出状态 + 清理）----
+on_exit() {
+    local exit_code=$?
+    if [ ${exit_code} -ne 0 ] && [ -d "${LOG_DIR:-}" ]; then
+        echo "[entrypoint] [FATAL] 脚本异常退出, exit_code=${exit_code}, LINENO=${BASH_LINENO[0]:-unknown}" >&2
+        python3 - "${LOG_DIR}/exit_status.json" "${exit_code}" <<'PYEXIT' 2>/dev/null || true
+import json, os, sys, time
+with open(sys.argv[1], "w") as f:
+    json.dump({
+        "exit_code": int(sys.argv[2]),
+        "end_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_epoch": int(time.time()),
+        "record_id": os.environ.get("RECORD_ID", ""),
+        "task_id": os.environ.get("TASK_ID", ""),
+    }, f, ensure_ascii=False, indent=2)
+PYEXIT
+    fi
+    cleanup
 }
 
 # ---- 函数: 检查 SGLang 服务是否可用 ----
@@ -496,7 +588,7 @@ restart_sglang_server() {
         fi
     done
 }
-trap cleanup EXIT
+trap on_exit EXIT
 
 # ============================================================
 # Step 0: 安装选手提交内容（可选）
