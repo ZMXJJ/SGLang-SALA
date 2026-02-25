@@ -70,7 +70,9 @@ RUN chmod +x /app/entrypoint.sh /app/bench_serving.sh
 ENV MODEL_PATH=/models/MiniCPM-SALA \
     PORT=30000 \
     PERF_DATA=/data/perf_public_set.jsonl \
-    SPEED_DATA=/data/speed_eval.jsonl \
+    SPEED_DATA_S1=/data/speed_bench_c1.jsonl \
+    SPEED_DATA_S8=/data/speed_bench_c8.jsonl \
+    SPEED_DATA_SMAX=/data/speed_bench_cunlimited.jsonl \
     RECORD_ID="" \
     USER_ID="" \
     TASK_ID=""

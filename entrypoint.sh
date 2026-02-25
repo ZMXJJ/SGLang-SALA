@@ -10,6 +10,14 @@
 #   5. 组装 JSON 结果输出到 stdout
 #   6. 关闭 SGLang 服务
 #
+# 状态回调 (POST {SCORE_SYNC_URL}/eval/callback):
+#   10  PENDING      - 任务已接收
+#   20  PREPARING    - 正在准备环境
+#   30  DOWNLOADING  - 正在下载/安装选手提交内容
+#   40  INFERENCING  - 正在执行推理评测
+#   200 SUCCESS      - 评测完成
+#   -1  FAILED       - 任务失败（附带 error_msg）
+#
 # 环境变量（后端传入）:
 #   MODEL_PATH         - 模型路径（必须）
 #   PORT               - SGLang 服务端口（默认 30000）
@@ -21,8 +29,12 @@
 #   SGLANG_KERNEL_WHEEL- 选手提交的 sgl-kernel wheel 路径（可选）
 #   SGLANG_SERVER_ARGS - SGLang 服务启动参数（可选；用于调整部署参数）
 #                        默认包含评测/加速相关参数（示例见 README）
-#   SPEED_DATA_SMAX    - 速度评测 Smax(不设并发上限) 数据集路径（可选；默认 /data/speed_bench_cunlimited.jsonl）
-#   SCORE_SYNC_URL     - 分数同步回调地址基址（可选；POST {SCORE_SYNC_URL}/score/sync）
+#   SPEED_DATA_S1      - 速度评测 S1(并发=1) 数据集路径（为保证评测一致性，本脚本内固定写死；外部传入会被忽略）
+#   SPEED_DATA_S8      - 速度评测 S8(并发=8) 数据集路径（为保证评测一致性，本脚本内固定写死；外部传入会被忽略）
+#   SPEED_DATA_SMAX    - 速度评测 Smax(不设并发上限) 数据集路径（为保证评测一致性，本脚本内固定写死；外部传入会被忽略）
+#   SCORE_SYNC_URL     - 回调地址基址（可选）
+#                        状态回调: POST {SCORE_SYNC_URL}/eval/callback
+#                        分数同步: POST {SCORE_SYNC_URL}/score/sync
 #   SCORE_SYNC_REQUIRED- 分数同步是否强依赖（可选；默认 0；为 1 时回调失败会置 state=0）
 #   速度评测数据（可选，未提供则跳过速度评测，仅输出 acc）:
 #     - /data/speed_bench_c1.jsonl   (S1 并发=1)
@@ -44,8 +56,25 @@ PERF_MAX_SAMPLES="${PERF_MAX_SAMPLES:-}"
 SGLANG_KERNEL_WHEEL="${SGLANG_KERNEL_WHEEL:-}"
 SGLANG_SERVER_ARGS_DEFAULT="--disable-radix-cache --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse"
 SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-${SGLANG_SERVER_ARGS_DEFAULT}}"
-SPEED_DATA_SMAX="${SPEED_DATA_SMAX:-/data/speed_bench_cunlimited.jsonl}"
-export SPEED_DATA_SMAX
+
+# ---- 速度评测数据集固定写死（防止外部注入篡改）----
+if [ -n "${SPEED_DATA_S1:-}" ] && [ "${SPEED_DATA_S1}" != "/data/speed_bench_c1.jsonl" ]; then
+    echo "[entrypoint] [WARN] 外部设置 SPEED_DATA_S1=${SPEED_DATA_S1} 将被忽略，使用固定数据集 /data/speed_bench_c1.jsonl" >&2
+fi
+if [ -n "${SPEED_DATA_S8:-}" ] && [ "${SPEED_DATA_S8}" != "/data/speed_bench_c8.jsonl" ]; then
+    echo "[entrypoint] [WARN] 外部设置 SPEED_DATA_S8=${SPEED_DATA_S8} 将被忽略，使用固定数据集 /data/speed_bench_c8.jsonl" >&2
+fi
+if [ -n "${SPEED_DATA_SMAX:-}" ] && [ "${SPEED_DATA_SMAX}" != "/data/speed_bench_cunlimited.jsonl" ]; then
+    echo "[entrypoint] [WARN] 外部设置 SPEED_DATA_SMAX=${SPEED_DATA_SMAX} 将被忽略，使用固定数据集 /data/speed_bench_cunlimited.jsonl" >&2
+fi
+if [ -n "${SPEED_DATA:-}" ]; then
+    echo "[entrypoint] [WARN] 检测到旧变量 SPEED_DATA=${SPEED_DATA}；该变量不再生效，将使用固定速度评测数据集路径" >&2
+fi
+
+SPEED_DATA_S1="/data/speed_bench_c1.jsonl"
+SPEED_DATA_S8="/data/speed_bench_c8.jsonl"
+SPEED_DATA_SMAX="/data/speed_bench_cunlimited.jsonl"
+export SPEED_DATA_S1 SPEED_DATA_S8 SPEED_DATA_SMAX
 SCORE_SYNC_URL="${SCORE_SYNC_URL:-}"
 SCORE_SYNC_REQUIRED="${SCORE_SYNC_REQUIRED:-0}"
 SCORE_SYNC_RETRIES="${SCORE_SYNC_RETRIES:-3}"
@@ -61,6 +90,43 @@ SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS//--attention_backend/--attention-backen
 
 API_BASE="http://127.0.0.1:${PORT}"
 VENV_DIR="/opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env"
+
+# ---- 函数: 状态回调（best-effort, POST {SCORE_SYNC_URL}/eval/callback）----
+status_callback() {
+    local status_code="$1"
+    local message="$2"
+    if [ -z "${SCORE_SYNC_URL}" ]; then
+        return 0
+    fi
+    local url="${SCORE_SYNC_URL%/}/eval/callback"
+    local payload
+    payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'record_id': sys.argv[1],
+    'user_id': sys.argv[2],
+    'status_code': int(sys.argv[3]),
+    'task_id': sys.argv[4],
+    'message': sys.argv[5]
+}, ensure_ascii=False, separators=(',',':')))" \
+        "${RECORD_ID}" "${USER_ID}" "${status_code}" "${TASK_ID}" "${message}") || true
+
+    if [ -n "${payload}" ]; then
+        curl -s -o /dev/null \
+            --connect-timeout "${SCORE_SYNC_CONNECT_TIMEOUT}" \
+            --max-time "${SCORE_SYNC_TIMEOUT}" \
+            -X POST "${url}" \
+            -H 'Content-Type: application/json' \
+            -d "${payload}" 2>/dev/null || true
+    fi
+    echo "[entrypoint] 状态回调: status_code=${status_code}, message=${message}" >&2
+}
+
+# ---- 状态 10: PENDING ----
+status_callback 10 "任务已接收，等待处理"
+
+# ---- 状态 20: PREPARING ----
+status_callback 20 "正在准备环境，激活虚拟环境"
 
 # ---- 激活虚拟环境 ----
 echo "[entrypoint] 激活虚拟环境: ${VENV_DIR}"
@@ -125,60 +191,44 @@ score_sync() {
         return 0
     fi
 
-    python3 - "$payload_json" <<'PY'
-import json
-import os
-import sys
-import time
-from urllib import request, error
+    local url="${SCORE_SYNC_URL%/}/score/sync"
+    local retries="${SCORE_SYNC_RETRIES}"
+    local connect_timeout="${SCORE_SYNC_CONNECT_TIMEOUT}"
+    local timeout="${SCORE_SYNC_TIMEOUT}"
+    local last_err=""
 
-base = (os.environ.get("SCORE_SYNC_URL") or "").strip()
-if not base:
-    sys.exit(0)
+    for i in $(seq 1 "${retries}"); do
+        local http_code=""
+        local body=""
+        http_code=$(curl -s -o /tmp/_score_sync_body -w '%{http_code}' \
+            --connect-timeout "${connect_timeout}" \
+            --max-time "${timeout}" \
+            -X POST "${url}" \
+            -H 'Content-Type: application/json' \
+            -d "${payload_json}") || true
+        body=$(cat /tmp/_score_sync_body 2>/dev/null || echo "")
 
-url = base.rstrip("/") + "/score/sync"
-payload = json.loads(sys.argv[1])
+        if [ "${http_code}" = "200" ]; then
+            local resultcode
+            resultcode=$(echo "${body}" | python3 -c "import json,sys; obj=json.load(sys.stdin); print(obj.get('resultcode',''))" 2>/dev/null || echo "")
+            if [ "${resultcode}" = "0000" ]; then
+                echo "[entrypoint] 分数同步成功: ${url}" >&2
+                return 0
+            fi
+            last_err="HTTP 200 但返回不符合预期: ${body:0:300}"
+        else
+            last_err="HTTP ${http_code}: ${body:0:300}"
+        fi
 
-retries = int(os.environ.get("SCORE_SYNC_RETRIES") or "3")
-connect_timeout = float(os.environ.get("SCORE_SYNC_CONNECT_TIMEOUT") or "5")
-timeout = float(os.environ.get("SCORE_SYNC_TIMEOUT") or "20")
+        echo "[entrypoint] [WARN] 分数同步失败 (attempt ${i}/${retries}): ${last_err}" >&2
+        if [ "${i}" -lt "${retries}" ]; then
+            local wait_sec=$(( 2 ** (i - 1) ))
+            [ "${wait_sec}" -gt 8 ] && wait_sec=8
+            sleep "${wait_sec}"
+        fi
+    done
 
-data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-headers = {"Content-Type": "application/json"}
-
-last_err = None
-for i in range(1, retries + 1):
-    try:
-        req = request.Request(url=url, data=data, headers=headers, method="POST")
-        with request.urlopen(req, timeout=connect_timeout + timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            status = resp.status
-
-        if status == 200:
-            try:
-                obj = json.loads(body)
-            except Exception:
-                obj = None
-
-            if isinstance(obj, dict) and obj.get("resultcode") == "0000":
-                print(f"[entrypoint] 分数同步成功: {url}", file=sys.stderr)
-                sys.exit(0)
-
-            last_err = f"HTTP 200 但返回不符合预期: {body[:300]}"
-        else:
-            last_err = f"HTTP {status}: {body[:300]}"
-    except Exception as e:
-        last_err = repr(e)
-
-    print(
-        f"[entrypoint] [WARN] 分数同步失败 (attempt {i}/{retries}): {last_err}",
-        file=sys.stderr,
-    )
-    if i < retries:
-        time.sleep(min(2** (i - 1), 8))
-
-sys.exit(1)
-PY
+    return 1
 }
 
 # ---- 函数: 输出最终 JSON ----
@@ -395,14 +445,69 @@ cleanup() {
         echo "[entrypoint] SGLang 服务已关闭" >&2
     fi
 }
+
+# ---- 函数: 检查 SGLang 服务是否可用 ----
+sglang_is_ready() {
+    # /health + /v1/models 都可用，且 /v1/models 返回可解析 JSON
+    if ! curl -sf "${API_BASE}/health" > /dev/null 2>&1; then
+        return 1
+    fi
+    if ! curl -sf "${API_BASE}/v1/models" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'data' in d and len(d['data'])>0" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# ---- 函数: 重启 SGLang 服务并等待就绪 ----
+restart_sglang_server() {
+    echo "[entrypoint] 尝试重启 SGLang 服务 ..." >&2
+    cleanup
+
+    python3 -m sglang.launch_server \
+        --model-path "${MODEL_PATH}" \
+        --trust-remote-code \
+        --port "${PORT}" \
+        ${SGLANG_SERVER_ARGS} \
+        --tp-size 1 \
+        --max-running-requests 32 \
+        --enable-metrics 1>&2 &
+
+    SGLANG_PID=$!
+    echo "[entrypoint] SGLang 进程 PID: ${SGLANG_PID}" >&2
+
+    local max_retries=120
+    local retry_count=0
+    while true; do
+        if sglang_is_ready; then
+            echo "[entrypoint] SGLang 服务已就绪！" >&2
+            return 0
+        fi
+
+        if [ -n "${SGLANG_PID}" ] && ! kill -0 "${SGLANG_PID}" 2>/dev/null; then
+            echo "[entrypoint] [ERROR] 重启后 SGLang 进程已退出" >&2
+            return 1
+        fi
+
+        sleep 5
+        retry_count=$((retry_count + 1))
+        if [ "${retry_count}" -ge "${max_retries}" ]; then
+            echo "[entrypoint] [ERROR] 重启等待超时 (${max_retries} 次重试)" >&2
+            return 1
+        fi
+    done
+}
 trap cleanup EXIT
 
 # ============================================================
 # Step 0: 安装选手提交内容（可选）
 # ============================================================
+# ---- 状态 30: DOWNLOADING ----
+status_callback 30 "正在下载并安装选手提交内容"
+
 echo "[entrypoint] 检查并安装选手 sgl-kernel 提交内容（如有）..."
 if ! install_submission_sgl_kernel; then
     echo "[entrypoint] [ERROR] ${SUBMISSION_ERROR}" >&2
+    status_callback -1 "任务失败: ${SUBMISSION_ERROR}"
     output_result "0" "${SUBMISSION_ERROR}" "0" '{"S1":0,"S8":0,"Smax":0}'
     exit 1
 fi
@@ -449,6 +554,7 @@ while true; do
     # 检查进程是否意外退出
     if ! kill -0 "${SGLANG_PID}" 2>/dev/null; then
         echo "[entrypoint] [ERROR] SGLang 进程已退出"
+        status_callback -1 "任务失败: SGLang 服务启动失败"
         output_result "0" "SGLang 服务启动失败" "0" '{"S1":0,"S8":0,"Smax":0}'
         exit 1
     fi
@@ -457,12 +563,16 @@ while true; do
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
         echo "[entrypoint] [ERROR] 等待超时 (${MAX_RETRIES} 次重试)"
+        status_callback -1 "任务失败: SGLang 服务启动超时"
         output_result "0" "SGLang 服务启动超时" "0" '{"S1":0,"S8":0,"Smax":0}'
         exit 1
     fi
     echo "  等待中... (${RETRY_COUNT}/${MAX_RETRIES})"
 done
 echo "[entrypoint] SGLang 服务已就绪！"
+
+# ---- 状态 40: INFERENCING ----
+status_callback 40 "SGLang 服务已就绪，正在执行推理评测"
 
 # ============================================================
 # Step 3: 运行 模型评测 (eval_model.py)
@@ -510,12 +620,12 @@ echo "[entrypoint] 运行 benchmark_duration (sglang.bench_serving) ..."
 BENCHMARK_DURATION='{"S1":0,"S8":0,"Smax":0}'
 BENCH_ERROR=""
 
-SPEED_BENCH_S1="/data/speed_bench_c1.jsonl"
-SPEED_BENCH_S8="/data/speed_bench_c8.jsonl"
+SPEED_BENCH_S1="${SPEED_DATA_S1}"
+SPEED_BENCH_S8="${SPEED_DATA_S8}"
 SPEED_BENCH_SMAX="${SPEED_DATA_SMAX}"
 
 if [ -f "${SPEED_BENCH_S1}" ] && [ -f "${SPEED_BENCH_S8}" ] && [ -f "${SPEED_BENCH_SMAX}" ]; then
-    BENCH_OUTPUT=$(bash /app/bench_serving.sh "${API_BASE}" 2>&1) || true
+    BENCH_OUTPUT=$(SPEED_DATA_S1="${SPEED_BENCH_S1}" SPEED_DATA_S8="${SPEED_BENCH_S8}" SPEED_DATA_SMAX="${SPEED_BENCH_SMAX}" bash /app/bench_serving.sh "${API_BASE}" 2>&1) || true
     echo "${BENCH_OUTPUT}"
 
     # 取最后一行作为 benchmark_duration JSON
@@ -526,23 +636,93 @@ if [ -f "${SPEED_BENCH_S1}" ] && [ -f "${SPEED_BENCH_S8}" ] && [ -f "${SPEED_BEN
         echo "[entrypoint] benchmark_duration: ${BENCHMARK_DURATION}"
 
         # 检查是否有档位失败（值为 0）
-        FAILED_LEVELS=$(python3 -c "
-import json
-result = json.loads('${BENCHMARK_DURATION}')
-failed = [k for k in ['S1', 'S8', 'Smax'] if result.get(k, 0) == 0]
-if failed:
-    print(','.join(failed))
-")
+        FAILED_LEVELS=$(BENCH_JSON="${BENCHMARK_DURATION}" python3 - <<'PY'
+import os, json
+result = json.loads(os.environ["BENCH_JSON"])
+failed = [k for k in ["S1", "S8", "Smax"] if result.get(k, 0) == 0]
+print(",".join(failed))
+PY
+)
+
         if [ -n "${FAILED_LEVELS}" ]; then
-            BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS} 值为 0"
-            echo "[entrypoint] [WARN] ${BENCH_ERROR}"
+            echo "[entrypoint] [WARN] benchmark_duration 存在 0 值，失败档位: ${FAILED_LEVELS}" >&2
+
+            # 若服务不可用（例如 SGLang 崩溃导致后续档位 connection refused），尝试重启一次后补跑失败档位
+            if ! sglang_is_ready; then
+                echo "[entrypoint] [WARN] 检测到 SGLang 服务不可用，准备重启并补跑失败档位" >&2
+                if ! restart_sglang_server; then
+                    BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS}（且 SGLang 重启失败）"
+                    echo "[entrypoint] [ERROR] ${BENCH_ERROR}" >&2
+                fi
+            fi
+
+            # 补跑失败档位（每档位单独跑一次，避免互相影响）
+            if [ -z "${BENCH_ERROR}" ] && sglang_is_ready; then
+                for LEVEL in $(echo "${FAILED_LEVELS}" | tr ',' ' '); do
+                    echo "[entrypoint] 补跑 benchmark_duration 档位: ${LEVEL}" >&2
+
+                    LEVEL_S1=""
+                    LEVEL_S8=""
+                    LEVEL_SMAX=""
+                    if [ "${LEVEL}" = "S1" ]; then
+                        LEVEL_S1="${SPEED_BENCH_S1}"
+                    elif [ "${LEVEL}" = "S8" ]; then
+                        LEVEL_S8="${SPEED_BENCH_S8}"
+                    elif [ "${LEVEL}" = "Smax" ]; then
+                        LEVEL_SMAX="${SPEED_BENCH_SMAX}"
+                    else
+                        echo "[entrypoint] [WARN] 未知档位: ${LEVEL}，跳过补跑" >&2
+                        continue
+                    fi
+
+                    LEVEL_OUTPUT=$(SPEED_DATA_S1="${LEVEL_S1}" SPEED_DATA_S8="${LEVEL_S8}" SPEED_DATA_SMAX="${LEVEL_SMAX}" bash /app/bench_serving.sh "${API_BASE}" 2>&1) || true
+                    echo "${LEVEL_OUTPUT}"
+
+                    LEVEL_RESULT=$(echo "${LEVEL_OUTPUT}" | tail -1)
+                    if [ -n "${LEVEL_RESULT}" ] && echo "${LEVEL_RESULT}" | python3 -c "import json,sys; json.loads(sys.stdin.read())" 2>/dev/null; then
+                        BENCHMARK_DURATION=$(BASE_JSON="${BENCHMARK_DURATION}" NEW_JSON="${LEVEL_RESULT}" python3 - <<'PY'
+import os, json
+base = json.loads(os.environ["BASE_JSON"])
+new = json.loads(os.environ["NEW_JSON"])
+for k, v in new.items():
+    try:
+        v = float(v)
+    except Exception:
+        continue
+    if k in base and v != 0:
+        base[k] = v
+print(json.dumps(base))
+PY
+)
+                        echo "[entrypoint] 补跑后 benchmark_duration: ${BENCHMARK_DURATION}" >&2
+                    else
+                        echo "[entrypoint] [WARN] 补跑 ${LEVEL} 未获得合法 JSON，忽略该次结果" >&2
+                    fi
+                done
+            fi
+
+            # 重新计算失败档位并更新 BENCH_ERROR
+            FAILED_LEVELS=$(BENCH_JSON="${BENCHMARK_DURATION}" python3 - <<'PY'
+import os, json
+result = json.loads(os.environ["BENCH_JSON"])
+failed = [k for k in ["S1", "S8", "Smax"] if result.get(k, 0) == 0]
+print(",".join(failed))
+PY
+)
+            if [ -n "${FAILED_LEVELS}" ]; then
+                BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS} 值为 0"
+                echo "[entrypoint] [WARN] ${BENCH_ERROR}" >&2
+            else
+                BENCH_ERROR=""
+                echo "[entrypoint] benchmark_duration 补跑成功: ${BENCHMARK_DURATION}" >&2
+            fi
         fi
     else
         BENCH_ERROR="benchmark_duration 获取失败，脚本执行异常"
         echo "[entrypoint] [ERROR] ${BENCH_ERROR}"
     fi
 else
-    echo "[entrypoint] 未提供速度评测数据集（${SPEED_BENCH_S1} / ${SPEED_BENCH_S8} / ${SPEED_BENCH_SMAX}），跳过速度评测" >&2
+    echo "[entrypoint] 未找到速度评测数据集文件（需要 ${SPEED_BENCH_S1} / ${SPEED_BENCH_S8} / ${SPEED_BENCH_SMAX}），跳过速度评测" >&2
 fi
 
 # ============================================================
@@ -564,7 +744,9 @@ elif [ -n "${BENCH_ERROR}" ]; then
 fi
 
 if [ -n "${FINAL_ERROR}" ]; then
+    status_callback -1 "任务失败: ${FINAL_ERROR}"
     output_result "0" "${FINAL_ERROR}" "${ACC}" "${BENCHMARK_DURATION}"
 else
+    status_callback 200 "评测完成"
     output_result "1" "" "${ACC}" "${BENCHMARK_DURATION}"
 fi

@@ -240,7 +240,7 @@ def score_exact_match(pred, gold, task="unknown"):
     # 针对长文本任务评分的瑕疵修复：
     # 如果是 QA 类型的任务，gold 列表通常是同一答案的不同表述（同义词），只要命中任意一个就算满分 1。
     # 如果是 CWE/FWE 类型的任务，gold 列表是必须全部提取出来的多个关键词，则算覆盖率。
-    if task in ['qa', 'niah', 'vt', 'lcx']:
+    if task in ['qa', 'niah', 'lcx']:
         # 只要包含任意一个候选答案即为完全正确
         hits = any(str(r).lower() in final.lower() for r in gold)
         return 1.0 if hits else 0.0
@@ -353,7 +353,7 @@ def main():
 
     mcq_tasks = ['mcq']
     long_context_tasks = [
-        'niah', 'cwe', 'fwe', 'qa', 'vt', 'lcx'
+        'niah', 'cwe', 'fwe', 'qa', 'lcx'
     ]
 
     for i, item in enumerate(dataset):
@@ -428,6 +428,9 @@ def main():
 
     with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump({
+            "task_id": task_id,
+            "record_id": record_id,
+            "user_id": user_id,
             "overall_accuracy": avg_score,
             "duration": duration,
             "total_tokens": total_output_tokens
