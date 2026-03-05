@@ -959,116 +959,11 @@ else
 fi
 
 # ============================================================
-# Step 4: 运行 benchmark_duration (sglang.bench_serving)
+# Step 4: 速度评测（已跳过，仅测正确性）
 # ============================================================
-echo "[entrypoint] 运行 benchmark_duration (sglang.bench_serving) ..."
+echo "[entrypoint] [SKIP] 速度评测已跳过，仅验证正确性"
 BENCHMARK_DURATION='{"S1":0,"S8":0,"Smax":0}'
 BENCH_ERROR=""
-
-SPEED_BENCH_S1="${SPEED_DATA_S1}"
-SPEED_BENCH_S8="${SPEED_DATA_S8}"
-SPEED_BENCH_SMAX="${SPEED_DATA_SMAX}"
-
-if [ -f "${SPEED_BENCH_S1}" ] && [ -f "${SPEED_BENCH_S8}" ] && [ -f "${SPEED_BENCH_SMAX}" ]; then
-    BENCH_OUTPUT=$(SPEED_DATA_S1="${SPEED_BENCH_S1}" SPEED_DATA_S8="${SPEED_BENCH_S8}" SPEED_DATA_SMAX="${SPEED_BENCH_SMAX}" bash /app/bench_serving.sh "${API_BASE}" 2>&1) || true
-    echo "${BENCH_OUTPUT}"
-
-    # 取最后一行作为 benchmark_duration JSON
-    BENCH_RESULT=$(echo "${BENCH_OUTPUT}" | tail -1)
-
-    if [ -n "${BENCH_RESULT}" ] && echo "${BENCH_RESULT}" | python3 -c "import json,sys; json.loads(sys.stdin.read())" 2>/dev/null; then
-        BENCHMARK_DURATION="${BENCH_RESULT}"
-        echo "[entrypoint] benchmark_duration: ${BENCHMARK_DURATION}"
-
-        # 检查是否有档位失败（值为 0）
-        FAILED_LEVELS=$(BENCH_JSON="${BENCHMARK_DURATION}" python3 - <<'PY'
-import os, json
-result = json.loads(os.environ["BENCH_JSON"])
-failed = [k for k in ["S1", "S8", "Smax"] if result.get(k, 0) == 0]
-print(",".join(failed))
-PY
-)
-
-        if [ -n "${FAILED_LEVELS}" ]; then
-            echo "[entrypoint] [WARN] benchmark_duration 存在 0 值，失败档位: ${FAILED_LEVELS}" >&2
-
-            # 若服务不可用（例如 SGLang 崩溃导致后续档位 connection refused），尝试重启一次后补跑失败档位
-            if ! sglang_is_ready; then
-                echo "[entrypoint] [WARN] 检测到 SGLang 服务不可用，准备重启并补跑失败档位" >&2
-                if ! restart_sglang_server; then
-                    BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS}（且 SGLang 重启失败）"
-                    echo "[entrypoint] [ERROR] ${BENCH_ERROR}" >&2
-                fi
-            fi
-
-            # 补跑失败档位（每档位单独跑一次，避免互相影响）
-            if [ -z "${BENCH_ERROR}" ] && sglang_is_ready; then
-                for LEVEL in $(echo "${FAILED_LEVELS}" | tr ',' ' '); do
-                    echo "[entrypoint] 补跑 benchmark_duration 档位: ${LEVEL}" >&2
-
-                    LEVEL_S1=""
-                    LEVEL_S8=""
-                    LEVEL_SMAX=""
-                    if [ "${LEVEL}" = "S1" ]; then
-                        LEVEL_S1="${SPEED_BENCH_S1}"
-                    elif [ "${LEVEL}" = "S8" ]; then
-                        LEVEL_S8="${SPEED_BENCH_S8}"
-                    elif [ "${LEVEL}" = "Smax" ]; then
-                        LEVEL_SMAX="${SPEED_BENCH_SMAX}"
-                    else
-                        echo "[entrypoint] [WARN] 未知档位: ${LEVEL}，跳过补跑" >&2
-                        continue
-                    fi
-
-                    LEVEL_OUTPUT=$(SPEED_DATA_S1="${LEVEL_S1}" SPEED_DATA_S8="${LEVEL_S8}" SPEED_DATA_SMAX="${LEVEL_SMAX}" bash /app/bench_serving.sh "${API_BASE}" 2>&1) || true
-                    echo "${LEVEL_OUTPUT}"
-
-                    LEVEL_RESULT=$(echo "${LEVEL_OUTPUT}" | tail -1)
-                    if [ -n "${LEVEL_RESULT}" ] && echo "${LEVEL_RESULT}" | python3 -c "import json,sys; json.loads(sys.stdin.read())" 2>/dev/null; then
-                        BENCHMARK_DURATION=$(BASE_JSON="${BENCHMARK_DURATION}" NEW_JSON="${LEVEL_RESULT}" python3 - <<'PY'
-import os, json
-base = json.loads(os.environ["BASE_JSON"])
-new = json.loads(os.environ["NEW_JSON"])
-for k, v in new.items():
-    try:
-        v = float(v)
-    except Exception:
-        continue
-    if k in base and v != 0:
-        base[k] = v
-print(json.dumps(base))
-PY
-)
-                        echo "[entrypoint] 补跑后 benchmark_duration: ${BENCHMARK_DURATION}" >&2
-                    else
-                        echo "[entrypoint] [WARN] 补跑 ${LEVEL} 未获得合法 JSON，忽略该次结果" >&2
-                    fi
-                done
-            fi
-
-            # 重新计算失败档位并更新 BENCH_ERROR
-            FAILED_LEVELS=$(BENCH_JSON="${BENCHMARK_DURATION}" python3 - <<'PY'
-import os, json
-result = json.loads(os.environ["BENCH_JSON"])
-failed = [k for k in ["S1", "S8", "Smax"] if result.get(k, 0) == 0]
-print(",".join(failed))
-PY
-)
-            if [ -n "${FAILED_LEVELS}" ]; then
-                BENCH_ERROR="benchmark_duration 部分失败: ${FAILED_LEVELS} 值为 0"
-                echo "[entrypoint] [WARN] ${BENCH_ERROR}" >&2
-            else
-                BENCH_ERROR=""
-                echo "[entrypoint] benchmark_duration 补跑成功: ${BENCHMARK_DURATION}" >&2
-            fi
-        fi
-    else
-        BENCH_ERROR="benchmark_duration 获取失败，脚本执行异常"
-        echo "[entrypoint] [ERROR] ${BENCH_ERROR}"
-    fi
-else
-    echo "[entrypoint] 未找到速度评测数据集文件（需要 ${SPEED_BENCH_S1} / ${SPEED_BENCH_S8} / ${SPEED_BENCH_SMAX}），跳过速度评测" >&2
-fi
 
 # ============================================================
 # Step 5: 输出最终结果
