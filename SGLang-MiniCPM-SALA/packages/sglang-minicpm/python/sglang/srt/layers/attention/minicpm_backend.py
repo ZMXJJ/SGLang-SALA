@@ -445,7 +445,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
             # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
             metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
-            metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group if seqlen_q_sparse_tensor.numel() > 0 else 0
+            metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
         else:
             decode_metadata = self.sparse_metadata_builder.build_sparse_decode_metadata(
                 forward_batch=forward_batch,
@@ -579,15 +579,17 @@ class MiniCPMSparseBackend(AttentionBackend):
             if all_sparse:
                 # all batch is sparse
                 metadata = self.forward_metadata
-                compressed_k = torch.zeros(
+                compressed_k = torch.full(
                     (forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
                     dtype=torch.bfloat16,
-                    device=self.device
-                        )
-                compressed_k2 = torch.zeros(
+                    device=self.device,
+                    fill_value=float('-inf')
+                )
+                compressed_k2 = torch.full(
                     (forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
                     dtype=torch.bfloat16, 
-                    device=self.device
+                    device=self.device,
+                    fill_value=float('-inf')
                 )
 
                 get_compress_k_v2(
@@ -817,10 +819,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 seq_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
                 seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
                 cache_lens = seq_lens_k - seq_lens_q
-
-        # When cache_lens is None (prefill with no history cache, i.e. q_len == k_len),
-        # max_pooling_1d_varlen still requires a valid int32 tensor. Use zeros.
-        if cache_lens is None:
+        else:
             batch_size = cu_seqlens_q.shape[0] - 1
             cache_lens = torch.zeros(batch_size, dtype=torch.int32, device=cu_seqlens_q.device)
 
@@ -1749,13 +1748,10 @@ class MiniCPMSparseBackend(AttentionBackend):
             # Update flashinfer metadata for CUDA graph replay
             # For sparse mode, use the wrapper-based pattern that preserves sparse_page_table
             if self.attention_kernel_type == "flashinfer":
-                # In CUDA graph mode, flashinfer requires the batch size to match
-                # the size used during capture (bs). Use bs (capture size) instead
-                # of real_bs to keep the wrapper batch size fixed. Padding slots
-                # beyond real_bs are filled with dummy values (zero-length sequences).
                 sparse_bs = bs * 2
+                sparse_real_bs = real_bs * 2
 
-                # Get views of pre-allocated buffers using CAPTURE batch size
+                # Get views of pre-allocated buffers
                 # kv_indptr is precomputed and static: [0, 1*K, 2*K, ..., sparse_bs*K]
                 kv_indptr_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_indptr"
@@ -1767,12 +1763,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 kv_last_page_len_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_last_page_len"
                 ][:sparse_bs]
-
-                # Pad kv_last_page_len beyond real entries with dummy value (1)
-                # so flashinfer doesn't see invalid zero-length last pages
-                real_sparse_bs = real_bs * 2
-                if real_sparse_bs < sparse_bs:
-                    kv_last_page_len_view[real_sparse_bs:].fill_(1)
+                kv_last_page_len_view[sparse_real_bs:].fill_(0)
 
                 # Retrieve the wrapper stored during capture
                 wrapper = metadata.decode_wrapper
@@ -1802,6 +1793,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                 metadata.flashinfer_kv_indices = kv_indices_view
                 metadata.flashinfer_kv_last_page_len = kv_last_page_len_view
 
+            self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :].fill_(float('-inf')) 
+            self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :].fill_(float('-inf'))
             metadata.k1.cu_seqlens[: real_bs + 1].copy_(forward_batch.cu_seqlens_k1_cpu)
             metadata.k2.cu_seqlens[: real_bs + 1].copy_(forward_batch.cu_seqlens_k2_cpu)
 

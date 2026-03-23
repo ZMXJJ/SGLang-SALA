@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from flashinfer import (
@@ -188,15 +189,14 @@ class FlashInferKernel(AttentionKernel):
         self.q_data_type = self.kv_cache_dtype
 
         # Create workspace buffers for flashinfer
-        # Note: 128MB is too small for models with many attention heads (e.g. MiniCPM),
-        # increase to 512MB to avoid "Buffer overflow" in flashinfer aligned_alloc.
+        workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
         self.decode_workspace = torch.empty(
-            512 * 1024 * 1024,
+            workspace_size,
             dtype=torch.uint8,
             device=self.device,
         )
         self.prefill_workspace = torch.empty(
-            512 * 1024 * 1024,
+            workspace_size,
             dtype=torch.uint8,
             device=self.device,
         )

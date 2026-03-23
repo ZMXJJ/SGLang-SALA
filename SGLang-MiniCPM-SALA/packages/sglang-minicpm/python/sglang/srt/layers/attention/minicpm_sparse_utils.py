@@ -366,11 +366,11 @@ def allocate_and_compress_keys(
             layer.device if hasattr(layer, "device") else torch.cuda.current_device()
         )
 
-    full_compressed_k1 = torch.zeros(
-        (k1_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device
+    full_compressed_k1 = torch.full(
+        (k1_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device, fill_value=float('-inf')
     )
-    full_compressed_k2 = torch.zeros(
-        (k2_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device
+    full_compressed_k2 = torch.full(
+        (k2_token_nums, layer.tp_k_head_num, layer.head_dim), dtype=dtype, device=device, fill_value=float('-inf')
     )
 
     if split_stage1:
@@ -503,8 +503,9 @@ def compressed_attention(
             )
     
             scale = 1.0 / math.sqrt(head_dim)
-            score = torch.bmm(q_reshape, k_reshape) * scale
-            score = F.softmax(score, dim=-1)
+            score = torch.bmm(q_reshape, k_reshape).mul_(scale)
+            torch.nan_to_num(score, nan=float("-inf"), posinf=float("-inf"), out=score)
+            torch.softmax(score, dim=-1, out=score)
             score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
         else:  
             score = infllmv2_attn_stage1(

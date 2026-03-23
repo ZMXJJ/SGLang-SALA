@@ -4,7 +4,7 @@
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/sglang_minicpm_ultra_attn"
+VENV_DIR="${SCRIPT_DIR}/sglang_minicpm_sala_env"
 
 # 激活 venv（如果未激活）
 if [ -z "${VIRTUAL_ENV}" ]; then
@@ -12,7 +12,7 @@ if [ -z "${VIRTUAL_ENV}" ]; then
         export VIRTUAL_ENV="${VENV_DIR}"
         export PATH="${VENV_DIR}/bin:$PATH"
     else
-        echo "错误: 未找到 sglang_minicpm_ultra_attn 环境，请先运行 bash install.sh"
+        echo "错误: 未找到 sglang_minicpm_sala_env 环境，请先运行 bash install.sh"
         exit 1
     fi
 fi

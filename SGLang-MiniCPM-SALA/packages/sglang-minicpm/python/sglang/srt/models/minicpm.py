@@ -669,5 +669,7 @@ class MiniCPMForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
+class MiniCPMSALAForCausalLM(MiniCPMForCausalLM):
+    pass
 
-EntryClass = MiniCPMForCausalLM
+EntryClass = [MiniCPMForCausalLM, MiniCPMSALAForCausalLM]
