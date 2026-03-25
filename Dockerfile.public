@@ -52,7 +52,7 @@ RUN . /opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env/bin/activate \
     && export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
     && export MAX_JOBS=${BUILD_JOBS} \
     && export CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
-    && export CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${BUILD_JOBS}" \
+    && export CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${BUILD_JOBS} -DENABLE_BELOW_SM90=ON" \
     && git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/" \
     && pip uninstall -y sgl-kernel \
     && pip install "scikit-build-core>=0.10" "cmake>=3.26,<4" \
